@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LinkedIn outreach assistant.
+"""AutoLink Messenger: a LinkedIn outreach assistant.
 
 Imports your LinkedIn connections export, segments it, drafts personalized
 messages for a campaign (template-based, optionally refined by Claude), and

@@ -1,4 +1,4 @@
-# LinkedIn outreach assistant
+# AutoLink Messenger
 
 A command-line tool for messaging your LinkedIn connections, for example to ask
 people to try a new product or to open investor conversations. It handles the
