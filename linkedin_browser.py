@@ -207,9 +207,13 @@ class LinkedInSender:
             self._close_overlays()
             return
 
+        # LinkedIn enables Send a moment after the text lands; give it a few seconds.
         send_btn = self._first_visible(SEND_BUTTON, "Send button")
+        deadline = time.monotonic() + 5
+        while not send_btn.is_enabled() and time.monotonic() < deadline:
+            time.sleep(0.25)
         if not send_btn.is_enabled():
-            raise SendError("Send button is disabled")
+            raise SendError("Send button stayed disabled after typing the message")
         send_btn.click()
 
         # LinkedIn empties the composer once the message is accepted.

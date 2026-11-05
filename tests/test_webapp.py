@@ -53,7 +53,7 @@ class WebAppTest(unittest.TestCase):
 
     def test_page_served(self):
         with urllib.request.urlopen(self.base + "/") as r:
-            self.assertIn(b"LinkedIn Outreach", r.read())
+            self.assertIn(b"AutoLink Messenger", r.read())
 
     def test_blank_fields_block_drafting(self):
         status, r = self.post("preview", self.draft_body(product=""))

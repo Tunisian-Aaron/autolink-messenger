@@ -26,7 +26,7 @@ except ImportError:
 COMPOSER = """<div id="overlay" {hidden}>
   <div class="msg-form__contenteditable" contenteditable="true" role="textbox"
        aria-label="Write a message…" style="min-height:40px;border:1px solid"></div>
-  <button class="msg-form__send-button" type="submit">Send</button>
+  <button class="msg-form__send-button" type="submit" disabled>Send</button>
   <button aria-label="Close your conversation with {name}">x</button>
 </div>
 <script>
@@ -35,6 +35,8 @@ const msgBtn = document.querySelector('main button');
 if (msgBtn) msgBtn.onclick = () => document.getElementById('overlay').hidden = false;
 document.querySelector('[aria-label^="Close"]').onclick = () => document.getElementById('overlay').hidden = true;
 box.addEventListener('keydown', e => {{ if (e.key === 'Enter') window.enterPressed = true; }});
+// Like LinkedIn: Send is disabled until text is in the box, and only enables a moment after input.
+box.addEventListener('input', () => {{ setTimeout(() => {{ document.querySelector('.msg-form__send-button').disabled = !box.innerText.trim(); }}, 400); }});
 document.querySelector('.msg-form__send-button').onclick = async () => {{
   if ({stuck}) return;
   await fetch('/sent', {{method: 'POST', body: JSON.stringify({{who: '{slug}', text: box.innerText}})}});
