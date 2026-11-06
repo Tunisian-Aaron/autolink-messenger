@@ -230,6 +230,7 @@
         <div style="display:flex;gap:6px"><input id="s-min" type="number" min="0" value="60"><input id="s-maxd" type="number" min="0" value="180"></div></div>
     </div>
     <div class="row">
+      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-personalize"> Personalize each message from their profile right before sending (needs the campaign's brief on the Review tab)</label>
       <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-headless"> Hide the browser window</label>
     </div>
     <div class="row">
@@ -467,8 +468,7 @@ $('r-list').onclick = async (e) => {
 // ---------- send ----------
 ['s-cap', 's-max', 's-min', 's-maxd'].forEach(id => { $(id).value = store.get(id, $(id).value); $(id).oninput = () => store.set(id, $(id).value); });
 $('s-campaign').onchange = () => { store.set('s-campaign', $('s-campaign').value); updateQueue(); };
-$('s-headless').checked = store.get('s-headless', false);
-$('s-headless').onchange = () => store.set('s-headless', $('s-headless').checked);
+['s-headless', 's-personalize'].forEach(id => { $(id).checked = store.get(id, false); $(id).onchange = () => store.set(id, $(id).checked); });
 function updateQueue() {
   const c = state && state.campaigns.find(c => c.name === $('s-campaign').value);
   $('s-queue').textContent = c ? `${c.counts.draft} waiting in this campaign` : '';
@@ -477,7 +477,7 @@ $('btn-login').onclick = (e) => { e.preventDefault(); guard($('btn-login'), asyn
 function sendBody(dry) {
   return { campaign: $('s-campaign').value, daily_cap: $('s-cap').value, max: dry ? 3 : $('s-max').value,
            min_delay: dry ? 0 : $('s-min').value, max_delay: dry ? 0 : $('s-maxd').value,
-           headless: $('s-headless').checked, dry_run: dry };
+           headless: $('s-headless').checked, personalize: $('s-personalize').checked, dry_run: dry };
 }
 $('btn-test').onclick = () => guard($('btn-test'), async () => { hide('send-msg'); await api('autosend', sendBody(true)); startPolling(); }, 'send-msg');
 $('btn-send').onclick = () => guard($('btn-send'), async () => {

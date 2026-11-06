@@ -514,6 +514,9 @@ def enrich_targets(db, args):
     """Contacts to read profiles for: a campaign's waiting messages, or the filters."""
     if getattr(args, "campaign", None):
         ids = [r["contact_id"] for r in campaign_messages(db, args.campaign, "draft")]
+        if getattr(args, "ids", None):
+            wanted = {int(i) for i in str(args.ids).split(",") if i.strip()}
+            ids = [i for i in ids if i in wanted]
         return [db.execute("SELECT * FROM contacts WHERE id=?", (i,)).fetchone() for i in ids]
     return select_contacts(db, args)
 
@@ -568,6 +571,24 @@ def cmd_enrich(db, args, page_factory=None, should_stop=lambda: False, sleep=tim
     return done
 
 
+def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep) -> str:
+    """Rewrite one waiting message from the person's profile and save it. With a `page`, the
+    profile is read first when it isn't in the database yet. Returns the new body."""
+    import linkedin_browser as lb
+    profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
+    if profile is None and page is not None and m["url"]:
+        p = lb.read_profile(page, m["url"], sleep=sleep)
+        db.execute("INSERT OR REPLACE INTO profiles (contact_id, headline, location, about, experience, "
+                   "education, fetched_at) VALUES (?,?,?,?,?,?,?)",
+                   (m["contact_id"], p["headline"], p["location"], p["about"], p["experience"], p["education"], now()))
+        db.commit()
+        profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
+    body = personalize(ai, m["base_body"] or m["body"], m, brief, profile)
+    db.execute("UPDATE messages SET body=?, ai_at=?, updated_at=? WHERE id=?", (body, now(), now(), m["id"]))
+    db.commit()
+    return body
+
+
 def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: False, sleep=time.sleep):
     camp = db.execute("SELECT * FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
     if camp is None:
@@ -579,11 +600,14 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
         db.execute("UPDATE campaigns SET brief=? WHERE id=?", (brief, camp["id"]))
         db.commit()
     msgs = [m for m in campaign_messages(db, args.campaign, "draft") if args.redo or not m["ai_at"]]
+    if args.max:
+        msgs = msgs[:args.max]
     if not msgs:
         print("Nothing to personalize: every waiting message is done (use --redo to do them again).")
         return
     ai = ai or ai_backend()  # fail before touching the browser if Claude isn't reachable
     if args.enrich:
+        args.ids = ",".join(str(m["contact_id"]) for m in msgs)  # only these people's profiles
         cmd_enrich(db, args, page_factory=page_factory, should_stop=should_stop, sleep=sleep)
     stop = stop_flag()
     print(f"Personalizing {len(msgs)} message(s) with {ai.name}...")
@@ -593,9 +617,9 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
             print("Stopped.")
             break
         who = f"{m['first_name']} {m['last_name']}"
-        profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
-        try:  # always start from the template text, so a redo doesn't build on the last rewrite
-            body = personalize(ai, m["base_body"] or m["body"], m, brief, profile)
+        has_profile = db.execute("SELECT 1 FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
+        try:  # always starts from the template text, so a redo doesn't build on the last rewrite
+            personalize_message(db, ai, m, brief)
         except Exception as e:  # keep the template draft rather than abort the batch
             print(f"  x {who}: {type(e).__name__}: {e}")
             if "authentication" in type(e).__name__.lower() or "401" in str(e):
@@ -603,10 +627,8 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
                       "terminal takes precedence over the .env file).")
                 break
             continue
-        db.execute("UPDATE messages SET body=?, ai_at=?, updated_at=? WHERE id=?", (body, now(), now(), m["id"]))
-        db.commit()
         done += 1
-        print(f"  ok {who}" + ("" if profile else " (profile not read yet: used name and headline only)"))
+        print(f"  ok {who}" + ("" if has_profile else " (profile not read yet: used name and headline only)"))
     print(f"Personalized {done} of {len(msgs)} message(s). Read them before sending: "
           f"outreach.py review {args.campaign}")
 
@@ -784,10 +806,18 @@ def cmd_login(db, args):
     lb.interactive_login(args.profile_dir, channel=args.channel)
 
 
-def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, cancelled=lambda: False):
+def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, cancelled=lambda: False, ai=None):
     import linkedin_browser as lb
     if args.min_delay > args.max_delay:
         raise SystemExit("--min-delay must be <= --max-delay")
+    brief = ""
+    if getattr(args, "personalize", False):  # fail before touching the browser if Claude isn't set up
+        camp = db.execute("SELECT brief FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
+        brief = (camp["brief"] if camp else "") or ""
+        if not brief:
+            raise SystemExit("--personalize needs the campaign's brief: set it with "
+                             f"`personalize {args.campaign} --brief '...'` (or on the Review tab).")
+        ai = ai or ai_backend()
     queue = campaign_messages(db, args.campaign, "draft")
     room = args.daily_cap - sent_last_24h(db)
     if not queue:
@@ -827,8 +857,17 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                 print(f"  waiting {delay:.0f}s...")
                 sleep(delay)
             who = f"{m['first_name']} {m['last_name']}"
+            body = m["body"]
+            if ai is not None and not m["ai_at"]:
+                try:  # read their profile and rewrite the draft now, just before it goes out
+                    body = personalize_message(db, ai, m, brief, page=page, sleep=sleep)
+                    print(f"  personalized {who}")
+                except lb.StopRun:
+                    raise
+                except Exception as e:
+                    print(f"  ! {who}: couldn't personalize ({type(e).__name__}: {e}); sending the template text")
             try:
-                sender.send(m["url"], m["body"], dry_run=args.dry_run)
+                sender.send(m["url"], body, dry_run=args.dry_run)
             except lb.StopRun as e:
                 print(f"STOPPED: {e}")
                 sender.screenshot(str(shots / f"stopped-{m['contact_id']}.png"))
@@ -957,6 +996,7 @@ def build_parser():
     s.add_argument("--brief", help="what this campaign is for (saved on the campaign)")
     s.add_argument("--enrich", action="store_true", help="read profiles first (opens the browser)")
     s.add_argument("--redo", action="store_true", help="also redo messages already personalized")
+    s.add_argument("--max", type=int, help="only the next N waiting messages")
     s.add_argument("--max-age-days", type=int, default=30, help=argparse.SUPPRESS)
     s.add_argument("--refresh", action="store_true", help=argparse.SUPPRESS)
     browser_args(s)
@@ -974,6 +1014,8 @@ def build_parser():
     s.add_argument("--max-delay", type=float, default=180, help="max seconds between messages (default 180)")
     s.add_argument("--dry-run", action="store_true",
                    help="open each profile and type the message, but don't press Send")
+    s.add_argument("--personalize", action="store_true",
+                   help="read each person's profile and have Claude rewrite their message right before sending")
     s.add_argument("--headless", action="store_true", help="hide the browser window")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt (for scheduled runs)")
     s.add_argument("--screenshots", default="failures", help="where to save failure screenshots")

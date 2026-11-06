@@ -49,6 +49,7 @@ document.querySelector('.msg-form__send-button').onclick = async () => {{
 PROFILE = """<!doctype html><html><body><main>
 <section><div><div><h1>{name}</h1><span>· {degree}</span></div>
 <p>Some headline</p>{button}</div></section>
+<section><h2>About</h2><p>Ten years in {name}'s field.</p></section>
 <aside><h2>More profiles for you</h2><p>Someone Else · 2nd</p><button>Follow</button></aside>
 </main>
 {composer}</body></html>"""
@@ -85,6 +86,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         slug = self.path.strip("/").split("/")[-1]
+        if "/details/" in self.path:
+            part = self.path.rstrip("/").split("/")[-1].capitalize()
+            html = f"<html><body><main><h2>{part}</h2><p>Something at Somewhere</p><aside><h3>More profiles for you</h3></aside></main></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
+            return
         if self.path.startswith("/messaging/compose/"):
             q = dict(p.split("=") for p in self.path.split("?")[1].split("&"))
             if "premium" in q:
@@ -196,6 +205,30 @@ class AutosendTest(unittest.TestCase):
         self.autosend(db, "--dry-run")
         self.assertEqual(Handler.sent, [])
         self.assertEqual(set(self.statuses(db)[i] for i in ids[:2]), {"draft"})
+
+    def test_personalize_just_before_sending(self):
+        class FakeClaude:
+            name = "fake"
+            prompts = []
+
+            def generate(self, prompt):
+                self.prompts.append(prompt)
+                return "Hi there,\n\nPersonal.\n\nSam"
+        db, ids = self.point_contacts(["ok1", "ok2"])
+        db.execute("UPDATE campaigns SET brief='Get feedback'")
+        db.commit()
+        ai = FakeClaude()
+        args = outreach.build_parser().parse_args(
+            ["--db", self.dbpath, "autosend", "c", "--headless", "--yes", "--min-delay", "0", "--max-delay", "0",
+             "--personalize", "--profile-dir", str(Path(self.tmp.name) / "profile"),
+             "--screenshots", str(Path(self.tmp.name) / "shots")])
+        outreach.cmd_autosend(db, args, sleep=lambda s: None, ai=ai)
+        self.assertEqual([s["text"] for s in Handler.sent], ["Hi there,\n\nPersonal.\n\nSam"] * 2)
+        self.assertEqual(len(ai.prompts), 2)
+        self.assertIn("Ten years in", ai.prompts[0])  # the profile was read first
+        self.assertIn("Something at Somewhere", ai.prompts[0])
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0], 2)
+        self.assertTrue(all(m["ai_at"] for m in outreach.campaign_messages(db, "c", "sent")))
 
     def test_daily_cap(self):
         db, ids = self.point_contacts(["ok1", "ok2"])

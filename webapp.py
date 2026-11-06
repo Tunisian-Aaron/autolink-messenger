@@ -350,6 +350,8 @@ class App:
             argv.append("--dry-run")
         if b.get("headless"):
             argv.append("--headless")
+        if b.get("personalize"):
+            argv.append("--personalize")
         if self.channel:
             argv += ["--channel", self.channel]
         ns = outreach.build_parser().parse_args(argv)
