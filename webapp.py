@@ -27,7 +27,7 @@ sys.path.insert(0, str(HERE))
 import outreach  # noqa: E402
 
 MAX_BODY = 50 * 1024 * 1024  # Connections.csv for ~30k connections is a few MB
-STALL_KILL_S = 180  # kill a LinkedIn import that has printed nothing for this long
+STALL_KILL_S = 180  # kill a browser job that has printed nothing for this long (sending/login get longer)
 
 
 class ApiError(Exception):
@@ -230,7 +230,7 @@ class App:
         self.start_process_job("personalizing", cmd)
         return {"ok": True}
 
-    def start_process_job(self, kind, cmd):
+    def start_process_job(self, kind, cmd, stall_s=STALL_KILL_S):
         # Browser work runs as a separate process: a browser call can hang for good if LinkedIn's
         # page dies, and a process can be killed where a thread can't. These commands save to the
         # database as they go, so killing one loses nothing.
@@ -247,8 +247,8 @@ class App:
                 if job.stop.is_set():
                     proc.terminate()
                     break
-                if time.monotonic() - last[0] > STALL_KILL_S:
-                    job.log.append(f"\nNothing happened for {STALL_KILL_S // 60} minutes - the browser looks stuck, "
+                if time.monotonic() - last[0] > stall_s:
+                    job.log.append(f"\nNothing happened for {stall_s // 60} minutes - the browser looks stuck, "
                                    f"so {kind} was stopped. What it did so far is saved; run it again to continue.\n")
                     proc.terminate()
                     break
@@ -328,17 +328,25 @@ class App:
         return {"ok": True}
 
     def api_login_start(self, b):
-        import linkedin_browser as lb
-
-        def run(job):
-            lb.interactive_login(self.profile_dir, channel=self.channel, cancelled=job.stop.is_set)
-
-        self.start_job("login", run)
+        self.start_process_job("login", self.outreach_cmd("login", *self.browser_opts()), stall_s=900)
         return {"ok": True}
+
+    def api_replies(self, b):
+        self.start_process_job("checking replies", self.outreach_cmd("replies", *self.browser_opts()))
+        return {"ok": True}
+
+    def api_delete_drafts(self, b):
+        out = captured(lambda: outreach.cmd_delete_drafts(self.db(), argparse.Namespace(campaign=b.get("campaign") or "")))
+        return {"message": out}
+
+    def api_delete_campaign(self, b):
+        out = captured(lambda: outreach.cmd_delete_campaign(
+            self.db(), argparse.Namespace(campaign=b.get("campaign") or "", force=bool(b.get("force")))))
+        return {"message": out}
 
     def api_autosend(self, b):
         campaign = b.get("campaign") or ""
-        argv = ["--db", self.db_path, "autosend", campaign, "--yes",
+        argv = ["autosend", campaign, "--yes",
                 "--daily-cap", str(int(b.get("daily_cap") or 20)),
                 "--min-delay", str(float(b["min_delay"] if b.get("min_delay") not in (None, "") else 60)),
                 "--max-delay", str(float(b["max_delay"] if b.get("max_delay") not in (None, "") else 180)),
@@ -354,20 +362,12 @@ class App:
             argv.append("--personalize")
         if self.channel:
             argv += ["--channel", self.channel]
-        ns = outreach.build_parser().parse_args(argv)
         if not campaign:
             raise ApiError("Pick a campaign.")
-
-        def run(job):
-            def sleep(seconds):
-                if job.stop.wait(seconds):
-                    raise Cancelled()
-            if job.stop.is_set():
-                raise Cancelled()
-            outreach.cmd_autosend(outreach.connect(self.db_path), ns, sleep=sleep, prompt=lambda _: "send",
-                                  cancelled=job.stop.is_set)
-
-        self.start_job("test run" if b.get("dry_run") else "sending", run)
+        outreach.build_parser().parse_args(["--db", self.db_path] + argv)  # validate before starting
+        max_delay = float(b["max_delay"] if b.get("max_delay") not in (None, "") else 180)
+        self.start_process_job("test run" if b.get("dry_run") else "sending", self.outreach_cmd(*argv),
+                               stall_s=max_delay + 300)  # a pause between messages is silence, not a hang
         return {"ok": True}
 
     def api_stop(self, b):
@@ -378,7 +378,8 @@ class App:
 
     ROUTES = {
         "state": api_state, "import": api_import, "import/linkedin": api_import_linkedin, "contacts": api_contacts,
-        "personalize": api_personalize,
+        "personalize": api_personalize, "replies": api_replies,
+        "campaign/delete-drafts": api_delete_drafts, "campaign/delete": api_delete_campaign,
         "preview": api_preview, "draft": api_draft, "messages": api_messages,
         "message": api_update_message, "dnc": api_dnc, "login/start": api_login_start,
         "autosend": api_autosend, "stop": api_stop,

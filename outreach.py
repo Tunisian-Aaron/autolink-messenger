@@ -111,6 +111,8 @@ def connect(path: str) -> sqlite3.Connection:
     if "base_body" not in cols:  # the template text, before Claude rewrote it
         db.execute("ALTER TABLE messages ADD COLUMN base_body TEXT")
         db.execute("UPDATE messages SET base_body=body")
+    if "reply" not in cols:  # what `replies` saw them answer
+        db.execute("ALTER TABLE messages ADD COLUMN reply TEXT")
     return db
 
 
@@ -400,7 +402,8 @@ def personalization_prompt(base: str, contact, brief: str, profile=None) -> str:
         "- Use only the facts above. Never invent shared history, mutual contacts or anything not "
         "stated. If the profile says little, change little.\n"
         "- Don't copy the headline or string job titles together; turn profile text into natural phrases.\n"
-        "- No compliments that could apply to anyone, nothing that sounds automated.\n"
+        "- No compliments that could apply to anyone, nothing that sounds automated. No flattery or "
+        "jokes about the person; if a detail could read as odd or backhanded, leave it out.\n"
         "Reply with the message text only: no preamble, labels or quotes."
     )
 
@@ -634,6 +637,91 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
 
 
 # --------------------------------------------------------------------------
+# Removing drafts / campaigns
+# --------------------------------------------------------------------------
+
+def cmd_delete_drafts(db, args):
+    """Remove a campaign's waiting (and skipped/failed) messages; sent and replied ones stay."""
+    camp = db.execute("SELECT id FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
+    if camp is None:
+        raise SystemExit(f"No campaign named '{args.campaign}'.")
+    n = db.execute("DELETE FROM messages WHERE campaign_id=? AND status IN ('draft','skipped','failed')",
+                   (camp["id"],)).rowcount
+    db.commit()
+    print(f"Removed {n} unsent message(s) from '{args.campaign}'.")
+
+
+def cmd_delete_campaign(db, args):
+    camp = db.execute("SELECT id FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
+    if camp is None:
+        raise SystemExit(f"No campaign named '{args.campaign}'.")
+    sent = db.execute("SELECT COUNT(*) FROM messages WHERE campaign_id=? AND status IN ('sent','replied')",
+                      (camp["id"],)).fetchone()[0]
+    if sent and not args.force:
+        raise SystemExit(f"'{args.campaign}' has {sent} sent message(s); their record would be lost. "
+                         "Use `delete-drafts` to keep them, or --force to delete everything.")
+    db.execute("DELETE FROM messages WHERE campaign_id=?", (camp["id"],))
+    db.execute("DELETE FROM campaigns WHERE id=?", (camp["id"],))
+    db.commit()
+    print(f"Deleted campaign '{args.campaign}'.")
+
+
+# --------------------------------------------------------------------------
+# Replies: read the inbox and mark who answered
+# --------------------------------------------------------------------------
+
+def parse_inbox_when(label: str, today: dt.date | None = None) -> dt.date | None:
+    """LinkedIn's conversation-list timestamps: '4:46 PM' (today), 'Nov 3', 'Nov 3, 2025'."""
+    today = today or dt.date.today()
+    label = (label or "").strip()
+    if re.match(r"^\d{1,2}:\d{2}\s*[AP]M$", label, re.I):
+        return today
+    for fmt in ("%b %d, %Y", "%b %d"):
+        with contextlib.suppress(ValueError):
+            d = dt.datetime.strptime(label, fmt).date()
+            return d if fmt.endswith("%Y") else d.replace(year=today.year if d.replace(year=today.year) <= today
+                                                               else today.year - 1)
+    return None
+
+
+def cmd_replies(db, args, page_factory=None, inbox=None):
+    """Scan the inbox; anyone we messaged whose latest message in the thread is theirs,
+    on or after the day we wrote, is marked replied."""
+    import linkedin_browser as lb
+    waiting = db.execute("SELECT m.*, c.first_name, c.last_name FROM messages m JOIN contacts c ON c.id=m.contact_id "
+                         "WHERE m.status='sent'").fetchall()
+    if not waiting:
+        print("No sent messages waiting for a reply.")
+        return 0
+    if inbox is None:
+        if page_factory is None:
+            def page_factory():
+                return lb.browser(args.profile_dir, headless=args.headless, channel=args.channel)
+        with page_factory() as page:
+            lb.ensure_logged_in(page, args.url or lb.MESSAGING_URL)
+            inbox = lb.read_inbox(page, args.url or lb.MESSAGING_URL, limit=args.limit)
+    by_name = {}
+    for conv in inbox:
+        by_name.setdefault(conv["name"].strip().lower(), conv)
+    found = 0
+    for m in waiting:
+        conv = by_name.get(f"{m['first_name']} {m['last_name']}".strip().lower())
+        if not conv or conv["from_me"]:
+            continue
+        when = parse_inbox_when(conv["when"])
+        if when and m["sent_at"] and when < dt.date.fromisoformat(m["sent_at"][:10]):
+            continue  # an older conversation, before our message
+        db.execute("UPDATE messages SET status='replied', reply=?, updated_at=? WHERE id=?",
+                   (conv["preview"][:500], now(), m["id"]))
+        found += 1
+        print(f"  replied: {m['first_name']} {m['last_name']}: {conv['preview'][:80]}")
+    db.commit()
+    print(f"Checked {len(inbox)} conversation(s): {found} new repl{'y' if found == 1 else 'ies'}, "
+          f"{len(waiting) - found} still waiting.")
+    return found
+
+
+# --------------------------------------------------------------------------
 # Review / export / status
 # --------------------------------------------------------------------------
 
@@ -803,7 +891,8 @@ def cmd_send(db, args, prompt=input, clipboard=copy_to_clipboard, opener=webbrow
 
 def cmd_login(db, args):
     import linkedin_browser as lb
-    lb.interactive_login(args.profile_dir, channel=args.channel)
+    stop = stop_flag()
+    lb.interactive_login(args.profile_dir, channel=args.channel, cancelled=stop.is_set)
 
 
 def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, cancelled=lambda: False, ai=None):
@@ -846,16 +935,29 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
 
     sent = failed = consecutive = 0
     shots = Path(args.screenshots)
+    stop = stop_flag()  # webapp.py's Stop button sends SIGTERM; a stop lands between messages
+
+    def stopping():
+        return stop.is_set() or cancelled()
+
+    def pace(seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not stopping():
+            sleep(min(1, max(0, end - time.monotonic())))
+
     with sender_factory() as page:
         sender = lb.LinkedInSender(page)
         first_url = next((m["url"] for m in batch if m["url"]), None)
         if first_url:  # logged out? wait for you to log in before touching the queue
-            lb.ensure_logged_in(page, lb.feed_url_for(first_url), cancelled=cancelled)
+            lb.ensure_logged_in(page, lb.feed_url_for(first_url), cancelled=stopping)
         for i, m in enumerate(batch):
             if i:
                 delay = random.uniform(args.min_delay, args.max_delay)
                 print(f"  waiting {delay:.0f}s...")
-                sleep(delay)
+                pace(delay)
+            if stopping():
+                print("Stopped.")
+                break
             who = f"{m['first_name']} {m['last_name']}"
             body = m["body"]
             if ai is not None and not m["ai_at"]:
@@ -1020,6 +1122,22 @@ def build_parser():
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt (for scheduled runs)")
     s.add_argument("--screenshots", default="failures", help="where to save failure screenshots")
     s.set_defaults(func=cmd_autosend)
+
+    s = sub.add_parser("replies", help="read your inbox and mark who replied")
+    browser_args(s)
+    s.add_argument("--limit", type=int, default=150, help="how many recent conversations to scan (default 150)")
+    s.add_argument("--headless", action="store_true", help="hide the browser window")
+    s.add_argument("--url", default=None, help=argparse.SUPPRESS)  # for tests
+    s.set_defaults(func=cmd_replies)
+
+    s = sub.add_parser("delete-drafts", help="remove a campaign's unsent messages (sent ones stay)")
+    s.add_argument("campaign")
+    s.set_defaults(func=cmd_delete_drafts)
+
+    s = sub.add_parser("delete-campaign", help="delete a campaign and all its messages")
+    s.add_argument("campaign")
+    s.add_argument("--force", action="store_true", help="even if it has sent messages")
+    s.set_defaults(func=cmd_delete_campaign)
 
     s = sub.add_parser("mark", help="set message status, e.g. when someone replies")
     s.add_argument("campaign")

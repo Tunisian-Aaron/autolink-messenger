@@ -42,7 +42,7 @@ This opens a page in your browser at http://127.0.0.1:8765 with four tabs:
 3. **Review:** edit or skip individual messages, mark replies, and requeue
    failures.
 4. **Send:** do a test run, then **Start sending**. You can watch progress live
-   and press Stop at any time.
+   and press Stop at any time; a stop lands between messages, never mid-send.
 
 The first time a browser window opens on LinkedIn's login page, log in there
 (the tool never sees your password); everything carries on by itself after that.
@@ -235,12 +235,22 @@ click **Message**, paste and send. Then answer in the terminal:
 ## 5. Track replies
 
 ```bash
-python outreach.py mark beta-oct 12,40 replied
+python outreach.py replies                 # reads your inbox, marks who answered
+python outreach.py mark beta-oct 12,40 replied   # or by hand
 python outreach.py status
 ```
 
-`status` shows draft, sent, skipped and replied counts and the reply rate for
-each campaign. Your data lives in `outreach.db` (SQLite, gitignored); set
+`replies` opens your inbox in the automation browser, scans the most recent
+conversations (150 by default, `--limit` to change) and marks a message
+*replied* when the latest message in that person's thread is theirs, on or
+after the day you wrote. The web page has a **Check replies** button on the
+Send tab. `status` shows draft, sent, skipped and replied counts and the reply
+rate for each campaign.
+
+To undo a campaign: `delete-drafts NAME` removes its unsent messages and keeps
+the record of what was sent; `delete-campaign NAME` removes everything (it
+refuses when messages were sent unless you pass `--force`). Both are on the
+Review tab too. Your data lives in `outreach.db` (SQLite, gitignored); set
 `--db` or `OUTREACH_DB` to keep it somewhere else.
 
 ## Before you message investors

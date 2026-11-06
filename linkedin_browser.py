@@ -322,6 +322,43 @@ def read_profile(page, url: str, sleep=time.sleep, pause=(2.0, 4.0)) -> dict:
 
 LOGIN_URL = "https://www.linkedin.com/login"
 FEED_URL = "https://www.linkedin.com/feed/"
+MESSAGING_URL = "https://www.linkedin.com/messaging/"
+# The inbox: one list item per conversation, with the name, a time label and a one-line preview
+# that starts with "You:" when the last message is ours.
+INBOX_LIST = "ul.msg-conversations-container__conversations-list, [class*='conversations-list']"
+INBOX_ITEM = "li"
+INBOX_WHEN = re.compile(r"^(\d{1,2}:\d{2}\s*[AP]M|[A-Z][a-z]{2} \d{1,2}(, \d{4})?|Yesterday|[A-Z][a-z]+day)$")
+
+
+def read_inbox(page, url: str = MESSAGING_URL, limit: int = 150) -> list[dict]:
+    """The most recent conversations: [{name, when, preview, from_me}], newest first."""
+    page.goto(url, wait_until="domcontentloaded")
+    LinkedInSender(page).check_blocked()
+    _wait_for_text(page, lambda ls: len(ls) > 10, timeout_s=10)
+    seen: dict = {}
+    idle = 0
+    while len(seen) < limit and idle < 3:
+        items = page.evaluate("""([listSel, itemSel]) => {
+          const list = document.querySelector(listSel) || document.querySelector('main');
+          return [...list.querySelectorAll(itemSel)].map(li => (li.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean));
+        }""", [INBOX_LIST, INBOX_ITEM])
+        before = len(seen)
+        for lines in items:
+            if len(lines) < 2:
+                continue
+            name = lines[0]
+            when = next((l for l in lines[1:4] if INBOX_WHEN.match(l)), "")
+            preview = next((l for l in lines[1:] if l != when and not INBOX_WHEN.match(l)
+                            and not re.match(r"^\d+$", l)), "")
+            if name not in seen:
+                seen[name] = {"name": name, "when": when, "preview": preview,
+                              "from_me": preview.lower().startswith("you:")}
+        idle = idle + 1 if len(seen) == before else 0
+        with contextlib.suppress(Exception):
+            page.evaluate("""(listSel) => { const l = document.querySelector(listSel);
+                if (l) l.scrollTop = l.scrollHeight; window.scrollTo(0, document.body.scrollHeight); }""", INBOX_LIST)
+        page.wait_for_timeout(1200)
+    return list(seen.values())[:limit]
 
 
 def current_url(page) -> str:

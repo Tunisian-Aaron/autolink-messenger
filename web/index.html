@@ -198,6 +198,11 @@
         </select></div>
     </div>
     <div id="r-list"></div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn small" id="btn-delete-drafts">Remove unsent messages</button>
+      <button class="btn small danger" id="btn-delete-campaign">Delete campaign</button>
+    </div>
+    <div class="msg" id="r-msg"></div>
   </div>
 
   <div class="card">
@@ -245,6 +250,8 @@
 
   <div class="card">
     <h2>Results</h2>
+    <p class="hint">"Check replies" opens your inbox in the browser window and marks everyone whose latest message in the thread is theirs. Run it every few days.</p>
+    <div class="row"><button class="btn" id="btn-replies">Check replies</button></div>
     <div class="tablewrap" style="margin-top:4px"><table id="stats"></table></div>
   </div>
 </section>
@@ -413,7 +420,9 @@ $('btn-draft').onclick = () => guard($('btn-draft'), async () => {
   hide('write-msg');
   const p = await api('preview', draftBody());
   if (!p.count) throw new Error('Nobody new matches - everyone is already in this campaign or was messaged recently.');
-  if (!confirm(`Create ${p.count} draft messages in "${draftBody().campaign}"? Nothing is sent yet.`)) return;
+  if (p.count > 200) {
+    if (prompt(`This would create ${p.count} draft messages in "${draftBody().campaign}" - that's most of your network. Narrow the filters on the Contacts tab, or type ${p.count} to confirm.`) !== String(p.count)) return;
+  } else if (!confirm(`Create ${p.count} draft messages in "${draftBody().campaign}"? Nothing is sent yet.`)) return;
   const r = await api('draft', draftBody());
   show('write-msg', r.message.replace(/Review with:.*$/, '') + ' Next: check them on the Review tab.', 'ok');
   $('previews').innerHTML = '';
@@ -434,11 +443,15 @@ $('btn-personalize').onclick = () => guard($('btn-personalize'), async () => {
 }, 'personalize-msg');
 $('btn-personalize-stop').onclick = () => api('stop');
 $('r-status').onchange = loadMessages;
-async function loadMessages() {
+const PAGE = 50;
+let shown = PAGE;
+async function loadMessages(more) {
   const campaign = $('r-campaign').value;
   if (!campaign) { $('r-list').innerHTML = '<p class="empty">Create a campaign on the Write tab first.</p>'; return; }
+  shown = more ? shown + PAGE : PAGE;
   const r = await api('messages', { campaign, status: $('r-status').value });
-  $('r-list').innerHTML = r.messages.map(m => {
+  const rest = r.messages.length - shown;
+  $('r-list').innerHTML = r.messages.slice(0, shown).map(m => {
     const draft = m.status === 'draft';
     const actions = draft
       ? `<button class="btn small" data-act="save">Save</button><button class="btn small" data-act="skipped">Skip</button>`
@@ -451,8 +464,20 @@ async function loadMessages() {
       ${draft ? `<textarea>${esc(m.body)}</textarea>` : `<pre>${esc(m.body)}</pre>`}
       ${m.error ? `<div class="err-note">${esc(m.error)}</div>` : ''}
       <div class="row">${actions}<button class="btn small danger" data-act="dnc">Never contact</button></div></div>`;
-  }).join('') || '<p class="empty">No messages here.</p>';
+  }).join('') + (rest > 0 ? `<div class="row" style="justify-content:center"><button class="btn" id="btn-more">Show ${Math.min(rest, PAGE)} more (${rest} left)</button></div>` : '')
+     || '<p class="empty">No messages here.</p>';
+  if ($('btn-more')) $('btn-more').onclick = () => loadMessages(true);
 }
+$('btn-delete-drafts').onclick = () => guard($('btn-delete-drafts'), async () => {
+  const c = $('r-campaign').value; if (!c) return;
+  if (!confirm(`Remove every unsent message from "${c}"? Sent and replied ones stay.`)) return;
+  const r = await api('campaign/delete-drafts', { campaign: c }); show('r-msg', r.message, 'ok'); await refresh(); await loadMessages();
+}, 'r-msg');
+$('btn-delete-campaign').onclick = () => guard($('btn-delete-campaign'), async () => {
+  const c = $('r-campaign').value; if (!c) return;
+  if (prompt(`Delete campaign "${c}" and all its messages, including the record of what was sent?\nType the campaign name to confirm.`) !== c) return;
+  const r = await api('campaign/delete', { campaign: c, force: true }); show('r-msg', r.message, 'ok'); await refresh(); await loadMessages();
+}, 'r-msg');
 $('r-list').onclick = async (e) => {
   const act = e.target.dataset.act; if (!act) return;
   const card = e.target.closest('.mcard'), id = card.dataset.id;
@@ -491,6 +516,7 @@ $('btn-send').onclick = () => guard($('btn-send'), async () => {
   await api('autosend', sendBody(false)); startPolling();
 }, 'send-msg');
 $('btn-stop').onclick = () => api('stop');
+$('btn-replies').onclick = () => guard($('btn-replies'), async () => { hide('send-msg'); await api('replies'); startPolling(); }, 'send-msg');
 
 function renderJob() {
   const j = state.job, running = j && j.running;
@@ -505,7 +531,7 @@ function renderJob() {
   $('btn-stop').style.display = running && !importing && !personalizing ? '' : 'none';
   $('btn-import-li-stop').style.display = running && importing ? '' : 'none';
   $('btn-personalize-stop').style.display = running && personalizing ? '' : 'none';
-  ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize'].forEach(id => $(id).disabled = !!running);
+  ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize', 'btn-replies'].forEach(id => $(id).disabled = !!running);
   $('ai-status').textContent = state.ai ? `Using ${state.ai}.` : 'Claude isn\'t reachable yet: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.';
   if (!running && polling) { clearInterval(polling); polling = null;
     if (store.get('tab') === 'review') loadMessages(); if (importing) search().catch(() => {}); }
