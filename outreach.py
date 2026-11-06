@@ -23,6 +23,7 @@ import contextlib
 import csv
 import datetime as dt
 import io
+import json
 import os
 import random
 import re
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     key TEXT UNIQUE NOT NULL,
     first_name TEXT, last_name TEXT, url TEXT, email TEXT,
     company TEXT, position TEXT, connected_on TEXT,
-    do_not_contact INTEGER NOT NULL DEFAULT 0
+    do_not_contact INTEGER NOT NULL DEFAULT 0,
+    tags TEXT  -- ",founder,travel," as set by `tag`; NULL until the person has been sorted
 );
 CREATE TABLE IF NOT EXISTS campaigns (
     id INTEGER PRIMARY KEY,
@@ -113,6 +115,8 @@ def connect(path: str) -> sqlite3.Connection:
         db.execute("UPDATE messages SET base_body=body")
     if "reply" not in cols:  # what `replies` saw them answer
         db.execute("ALTER TABLE messages ADD COLUMN reply TEXT")
+    if "tags" not in {r[1] for r in db.execute("PRAGMA table_info(contacts)")}:
+        db.execute("ALTER TABLE contacts ADD COLUMN tags TEXT")
     return db
 
 
@@ -237,6 +241,8 @@ def add_filter_args(p):
     g.add_argument("--title", action="append", default=[], help="position/title contains")
     g.add_argument("--exclude-company", action="append", default=[])
     g.add_argument("--exclude-title", action="append", default=[])
+    g.add_argument("--tag", action="append", default=[], help="has this tag (see `tag`)")
+    g.add_argument("--exclude-tag", action="append", default=[])
     g.add_argument("--since", help="connected on or after YYYY-MM-DD")
     g.add_argument("--before", help="connected before YYYY-MM-DD")
     g.add_argument("--ids", help="comma-separated contact ids")
@@ -257,6 +263,11 @@ def select_contacts(db, args, extra_where: str = "", extra_params=()):
     any_like("position", args.title)
     any_like("company", args.exclude_company, negate=True)
     any_like("position", args.exclude_title, negate=True)
+    for values, negate in ((getattr(args, "tag", []), False), (getattr(args, "exclude_tag", []), True)):
+        if values:
+            clause = " OR ".join("COALESCE(tags,'') LIKE ?" for _ in values)
+            where.append(f"NOT ({clause})" if negate else f"({clause})")
+            params.extend(f"%,{v.strip().lower()},%" for v in values)
     if args.since:
         where.append("connected_on >= ?")
         params.append(args.since)
@@ -281,7 +292,7 @@ def cmd_list(db, args):
     for c in rows:
         name = f"{c['first_name']} {c['last_name']}"
         print(f"{c['id']:>5}  {name[:26]:<26}  {c['position'][:40]:<40}  "
-              f"{c['company'][:28]:<28}  {c['connected_on'] or ''}")
+              f"{c['company'][:28]:<28}  {c['connected_on'] or ''}  {' '.join(tags_of(c))}")
     print(f"\n{len(rows)} contact(s) match.")
 
 
@@ -290,6 +301,125 @@ def cmd_dnc(db, args):
     db.executemany("UPDATE contacts SET do_not_contact=? WHERE id=?", [(0 if args.undo else 1, i) for i in ids])
     db.commit()
     print(f"{'Cleared' if args.undo else 'Set'} do-not-contact on {len(ids)} contact(s).")
+
+
+# --------------------------------------------------------------------------
+# Tagging: sorting people into groups with Claude
+# --------------------------------------------------------------------------
+# Keyword filters misfire ("remote" matches remote patient monitoring). `tag` has Claude read
+# each headline in context and assign the groups you define, 25 people per call. Tags are
+# stored as ",a,b," so a filter can match a whole tag.
+
+TAG_BATCH = 25
+
+
+def tags_of(contact) -> list[str]:
+    return [t for t in (contact["tags"] or "").split(",") if t]
+
+
+def tags_value(tags) -> str:
+    return "," + ",".join(dict.fromkeys(tags)) + "," if tags else ","
+
+
+def parse_tag_spec(spec: str) -> list[tuple[str, str]]:
+    """'founder: started a company\ntravel: works in travel or hospitality' -> [(name, description)].
+    One tag per line, or a comma-separated list of names when there are no descriptions."""
+    parts = spec.splitlines() if "\n" in spec.strip() or ":" in spec else spec.split(",")
+    out = []
+    for part in parts:
+        name, _, desc = part.partition(":")
+        name = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-")
+        if name and name not in [n for n, _ in out]:
+            out.append((name, desc.strip()))
+    return out
+
+
+def tagging_prompt(tags, people) -> str:
+    groups = "\n".join(f"- {n}: {d}" if d else f"- {n}" for n, d in tags)
+    rows = "\n".join(f"{p['id']}: {p['first_name']} {p['last_name']} | {p['position'] or '-'} | {p['company'] or '-'}"
+                      for p in people)
+    return ("Sort these LinkedIn contacts into groups from their headline and company.\n\n"
+            f"Groups:\n{groups}\n\n"
+            "Rules: read each headline in context, not by keyword (someone in remote patient monitoring is "
+            "not a remote worker; a student of finance is not an investor). A person may belong to several "
+            "groups, or to none when nothing fits. Use only the group names above, exactly as written.\n\n"
+            f"Contacts (id: name | headline | company):\n{rows}\n\n"
+            'Reply with JSON only: an object mapping every id to a list of group names, '
+            'e.g. {"12": ["founder"], "13": []}.')
+
+
+def parse_tag_reply(reply: str, allowed, ids) -> dict:
+    m = re.search(r"\{.*\}", reply or "", re.S)
+    try:
+        data = json.loads(m.group(0)) if m else {}
+    except json.JSONDecodeError:
+        data = {}
+    out = {}
+    for k, v in data.items():
+        try:
+            cid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if cid not in ids:
+            continue
+        v = [v] if isinstance(v, str) else (v or [])
+        out[cid] = [t for t in dict.fromkeys(str(x).strip().lower() for x in v) if t in allowed]
+    return out
+
+
+def cmd_tag(db, args, ai=None):
+    tags = parse_tag_spec(args.tags or "")
+    if not tags:
+        raise SystemExit("Pass --tags 'founder: started a company' (one per line, or a comma-separated list).")
+    allowed = {n for n, _ in tags}
+    people = select_contacts(db, args, "" if args.redo else "tags IS NULL")
+    if args.max:
+        people = people[:args.max]
+    if not people:
+        print("Everyone matching is tagged already (use --redo to sort them again).")
+        return
+    ai = ai or ai_backend()
+    stop = stop_flag()
+    print(f"Sorting {len(people)} people into {', '.join(allowed)} with {ai.name}...")
+    counts, done = {n: 0 for n, _ in tags}, 0
+    for i in range(0, len(people), TAG_BATCH):
+        if stop.is_set():
+            print("Stopped.")
+            break
+        batch = people[i:i + TAG_BATCH]
+        ids = {p["id"] for p in batch}
+        try:
+            result = parse_tag_reply(ai.generate(tagging_prompt(tags, batch)), allowed, ids)
+        except Exception as e:
+            print(f"  x people {batch[0]['id']}-{batch[-1]['id']}: {type(e).__name__}: {e}")
+            if "authentication" in type(e).__name__.lower() or "401" in str(e):
+                print("STOPPED: Claude rejected the API key. Check ANTHROPIC_API_KEY.")
+                break
+            continue
+        if not result:
+            print(f"  x people {batch[0]['id']}-{batch[-1]['id']}: Claude's answer wasn't usable; skipped")
+            continue
+        for p in batch:  # an id Claude left out gets no groups, so it isn't asked about again
+            chosen = result.get(p["id"], [])
+            db.execute("UPDATE contacts SET tags=? WHERE id=?", (tags_value(chosen), p["id"]))
+            for t in chosen:
+                counts[t] += 1
+        db.commit()
+        done += len(batch)
+        print(f"  {done}/{len(people)}", end="\r")
+    summary = ", ".join(f"{n} {c}" for n, c in counts.items())
+    print(f"Sorted {done} of {len(people)} people: {summary}. "
+          "Filter with --tag NAME; send to the most important first with draft --priority.")
+
+
+def prioritize(contacts, priority) -> list:
+    """Stable-sort contacts by the first of their tags that appears in `priority` (a comma list);
+    untagged or unmatched people come last."""
+    order = [t.strip().lower() for t in (priority or "").split(",") if t.strip()]
+    if not order:
+        return list(contacts)
+    rank = {t: i for i, t in enumerate(order)}
+    return sorted(contacts, key=lambda c: min((rank[t] for t in tags_of(c) if t in rank), default=len(order)))
 
 
 # --------------------------------------------------------------------------
@@ -377,7 +507,7 @@ def ai_backend_name() -> str | None:
         return None
 
 
-def personalization_prompt(base: str, contact, brief: str, profile=None) -> str:
+def recipient_facts(contact, profile=None) -> list[str]:
     facts = [f"Name: {contact['first_name']} {contact['last_name']}",
              f"Headline: {(profile and profile['headline']) or contact['position'] or 'unknown'}",
              f"Company: {contact['company'] or 'unknown'}"]
@@ -386,11 +516,15 @@ def personalization_prompt(base: str, contact, brief: str, profile=None) -> str:
                            ("Experience", "experience"), ("Education", "education")):
             if profile[key]:
                 facts.append(f"{label}:\n{profile[key]}")
+    return facts
+
+
+def personalization_prompt(base: str, contact, brief: str, profile=None) -> str:
     return (
         "You help someone send a short LinkedIn message to one of their existing connections.\n\n"
         f"Campaign goal:\n{brief}\n\n"
         "Recipient, from their LinkedIn profile. This is everything known about them:\n"
-        + "\n".join(facts) + "\n\n"
+        + "\n".join(recipient_facts(contact, profile)) + "\n\n"
         f"Draft message:\n{base}\n\n"
         "Rewrite the draft so it reads as written for this person:\n"
         "- Keep the draft's structure, voice, core ask, links and sign-off.\n"
@@ -408,28 +542,93 @@ def personalization_prompt(base: str, contact, brief: str, profile=None) -> str:
     )
 
 
+# --- Checking a rewrite before it goes out ---------------------------------------
+# A rewrite that drops a link, changes the sign-off or claims something the profile doesn't
+# say is worse than the plain template. The cheap checks below run on every rewrite; when they
+# pass, one more short Claude call looks for invented facts. Anything wrong gets one retry
+# with the problems spelled out, then the template is sent instead.
+
 MAX_GROWTH = 1.15  # a personalized message may be at most this much longer than the template
+URL_RE = re.compile(r"https?://[^\s<>\"')\]]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|co|app|dev|me|so|"
+                    r"xyz|info|eu|uk|de|fr|es|it|nl|ca|us|au|in|ch|se|no|dk|fi|pt|be|at|pl|tn|ly|to|tv)"
+                    r"(?:/[^\s<>\"')\]]*)?", re.I)
+PREAMBLE_RE = re.compile(r"(?i)^(here('s| is)\b|sure\b|subject:|\"|\u201c|```)")
 
 
-def personalize(ai, base: str, contact, brief: str, profile=None) -> str:
-    """Have Claude tailor the rendered draft. Returns the draft unchanged on a refusal.
+def rewrite_problems(base: str, text: str, contact=None) -> list[str]:
+    """What a rewrite changed that it must not have. Empty list means it passed."""
+    problems = []
+    limit = int(len(base.split()) * MAX_GROWTH)
+    if len(text.split()) > limit:
+        problems.append(f"it is {len(text.split())} words; the limit is {limit}")
+    for url in dict.fromkeys(u.rstrip(".,") for u in URL_RE.findall(base)):
+        if url not in text:
+            problems.append(f"the link {url} is missing or changed; it must appear exactly as in the draft")
+    base_lines = [ln.strip() for ln in base.splitlines() if ln.strip()]
+    text_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not text_lines:
+        return ["it is empty"]
+    if len(base_lines) > 1 and len(base_lines[-1].split()) <= 5 and base_lines[-1] != text_lines[-1]:
+        problems.append(f"the sign-off must stay exactly {base_lines[-1]!r}")
+    first = (contact["first_name"] or "").split(" ")[0] if contact is not None and contact["first_name"] else ""
+    first = re.sub(r"[^\w'-]", "", first)  # names come with emoji and symbols; greet by the letters
+    if first and first.lower() not in text_lines[0].lower():
+        problems.append(f"the first line must greet {first}, as the draft does")
+    if PLACEHOLDER.search(text) or re.search(r"\[[^\]\n]{1,40}\]", text):
+        problems.append("it contains an unfilled placeholder")
+    if PREAMBLE_RE.match(text):
+        problems.append("it starts with a preamble, a subject line or quotes instead of the message itself")
+    return problems
 
-    Models don't count words well, so an over-long result gets one more pass asking
-    for a cut; if that's still too long, the shorter of the two is kept.
+
+def grounding_prompt(text: str, contact, profile=None) -> str:
+    return ("A message is about to be sent to a LinkedIn connection. Below is everything the sender knows "
+            "about the recipient, then the message.\n\nKnown facts:\n"
+            + "\n".join(recipient_facts(contact, profile)) + f"\n\nMessage:\n{text}\n\n"
+            "List every statement the message makes about the recipient (their work, past, places, studies, "
+            "achievements, opinions, or their relationship with the sender) that the known facts do not "
+            "support. A fair paraphrase of a fact is supported. Ignore what the message says about the sender, "
+            "their product and the ask. Reply with exactly NONE if every statement is supported; otherwise "
+            "one unsupported statement per line, nothing else.")
+
+
+def unsupported_claims(ai, text: str, contact, profile=None) -> list[str]:
+    reply = (ai.generate(grounding_prompt(text, contact, profile)) or "").strip()
+    if not reply or reply.upper().startswith("NONE"):
+        return []
+    return [ln.strip("-*\u2022 ").strip() for ln in reply.splitlines() if ln.strip()][:5]
+
+
+def check_rewrite(ai, base: str, text: str, contact, profile=None) -> list[str]:
+    problems = rewrite_problems(base, text, contact)
+    if not problems:  # the grounding check costs a call, so only when the free checks pass
+        problems = [f"it says something the profile doesn't support: {c}"
+                    for c in unsupported_claims(ai, text, contact, profile)]
+    return problems
+
+
+def personalize(ai, base: str, contact, brief: str, profile=None) -> tuple[str, str]:
+    """Have Claude tailor the rendered draft and check the result.
+
+    Returns (text, note): note is empty when the rewrite passed, otherwise why the
+    template text is being used instead.
     """
     prompt = personalization_prompt(base, contact, brief, profile)
     text = (ai.generate(prompt) or "").strip()
     if not text:
-        return base
-    limit = int(len(base.split()) * MAX_GROWTH)
-    if len(text.split()) > limit:
-        shorter = (ai.generate(
-            f"{prompt}\n\nYour previous version is below. It is {len(text.split())} words; the limit is {limit}. "
-            f"Rewrite it to at most {limit} words: keep the single best personal detail and the ask, cut the rest.\n\n"
-            f"{text}") or "").strip()
-        if shorter and len(shorter.split()) < len(text.split()):
-            text = shorter
-    return text
+        return base, "Claude declined; using the template text"
+    problems = check_rewrite(ai, base, text, contact, profile)
+    if not problems:
+        return text, ""
+    retry = (ai.generate(
+        f"{prompt}\n\nYour previous version is below. Problems with it:\n- " + "\n- ".join(problems)
+        + "\n\nFix every problem. Keep the single best personal detail and the ask; everything the draft "
+        f"had that must not change stays exactly as it was.\n\n{text}") or "").strip()
+    if retry:
+        problems = check_rewrite(ai, base, retry, contact, profile)
+        if not problems:
+            return retry, ""
+    return base, "using the template text; the rewrite " + "; ".join(problems)
 
 
 def draft_candidates(db, args):
@@ -464,7 +663,7 @@ def cmd_draft(db, args):
     template = template or camp["template"]
     brief = args.brief or (camp["brief"] if camp else None) or ""
 
-    contacts = draft_candidates(db, args)
+    contacts = prioritize(draft_candidates(db, args), getattr(args, "priority", None))
     if not contacts:
         print("No new contacts match these filters.")
         return
@@ -487,7 +686,9 @@ def cmd_draft(db, args):
         if client is not None:
             try:
                 profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (c["id"],)).fetchone()
-                body = personalize(client, body, c, brief, profile)
+                body, note = personalize(client, body, c, brief, profile)
+                if note:
+                    print(f"  ! #{c['id']}: {note}")
             except Exception as e:  # keep the template draft rather than abort the batch
                 print(f"  ! AI personalization failed for #{c['id']} ({type(e).__name__}: {e}); using template.")
         if len(body) > LINKEDIN_MAX_CHARS:
@@ -576,7 +777,8 @@ def cmd_enrich(db, args, page_factory=None, should_stop=lambda: False, sleep=tim
 
 def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep) -> str:
     """Rewrite one waiting message from the person's profile and save it. With a `page`, the
-    profile is read first when it isn't in the database yet. Returns the new body."""
+    profile is read first when it isn't in the database yet. Returns (body, note): the note says
+    why the template text was kept, or is empty."""
     import linkedin_browser as lb
     profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
     if profile is None and page is not None and m["url"]:
@@ -586,10 +788,10 @@ def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep) -> s
                    (m["contact_id"], p["headline"], p["location"], p["about"], p["experience"], p["education"], now()))
         db.commit()
         profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
-    body = personalize(ai, m["base_body"] or m["body"], m, brief, profile)
+    body, note = personalize(ai, m["base_body"] or m["body"], m, brief, profile)
     db.execute("UPDATE messages SET body=?, ai_at=?, updated_at=? WHERE id=?", (body, now(), now(), m["id"]))
     db.commit()
-    return body
+    return body, note
 
 
 def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: False, sleep=time.sleep):
@@ -622,7 +824,7 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
         who = f"{m['first_name']} {m['last_name']}"
         has_profile = db.execute("SELECT 1 FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
         try:  # always starts from the template text, so a redo doesn't build on the last rewrite
-            personalize_message(db, ai, m, brief)
+            _, note = personalize_message(db, ai, m, brief)
         except Exception as e:  # keep the template draft rather than abort the batch
             print(f"  x {who}: {type(e).__name__}: {e}")
             if "authentication" in type(e).__name__.lower() or "401" in str(e):
@@ -631,7 +833,8 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
                 break
             continue
         done += 1
-        print(f"  ok {who}" + ("" if has_profile else " (profile not read yet: used name and headline only)"))
+        print(f"  {'!' if note else 'ok'} {who}" + (f": {note}" if note else "")
+              + ("" if has_profile else " (profile not read yet: used name and headline only)"))
     print(f"Personalized {done} of {len(msgs)} message(s). Read them before sending: "
           f"outreach.py review {args.campaign}")
 
@@ -962,8 +1165,8 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
             body = m["body"]
             if ai is not None and not m["ai_at"]:
                 try:  # read their profile and rewrite the draft now, just before it goes out
-                    body = personalize_message(db, ai, m, brief, page=page, sleep=sleep)
-                    print(f"  personalized {who}")
+                    body, note = personalize_message(db, ai, m, brief, page=page, sleep=sleep)
+                    print(f"  ! {who}: {note}" if note else f"  personalized {who}")
                 except lb.StopRun:
                     raise
                 except Exception as e:
@@ -1033,6 +1236,8 @@ def build_parser():
     s.add_argument("--ai", action="store_true", help="personalize each draft with Claude (needs ANTHROPIC_API_KEY)")
     s.add_argument("--cooldown-days", type=int, default=30,
                    help="skip anyone messaged in any campaign within N days (default 30)")
+    s.add_argument("--priority", metavar="TAG,TAG,...",
+                   help="queue people with these tags first, in this order (see `tag`)")
     s.add_argument("--dry-run", action="store_true", help="preview 3 drafts, save nothing")
     add_filter_args(s)
     s.set_defaults(func=cmd_draft)
@@ -1082,6 +1287,14 @@ def build_parser():
     def pacing_args(sp, lo, hi):
         sp.add_argument("--min-delay", type=float, default=lo, help=f"min seconds between people (default {lo:.0f})")
         sp.add_argument("--max-delay", type=float, default=hi, help=f"max seconds between people (default {hi:.0f})")
+
+    s = sub.add_parser("tag", help="have Claude sort contacts into groups you define, from their headlines")
+    s.add_argument("--tags", required=True, metavar="SPEC",
+                   help="one per line as 'name: what it means', or a comma-separated list of names")
+    s.add_argument("--redo", action="store_true", help="sort people who already have tags again")
+    s.add_argument("--max", type=int, help="only the first N people")
+    add_filter_args(s)
+    s.set_defaults(func=cmd_tag)
 
     s = sub.add_parser("enrich", help="read About/Experience/Education from LinkedIn profiles (for personalize)")
     s.add_argument("--campaign", help="the people with waiting messages in this campaign (else: the filters)")

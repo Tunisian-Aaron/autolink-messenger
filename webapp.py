@@ -116,11 +116,24 @@ class App:
             company=self._list(f.get("company")), title=self._list(f.get("title")),
             exclude_company=self._list(f.get("exclude_company")),
             exclude_title=self._list(f.get("exclude_title")),
+            tag=self._list(f.get("tag")), exclude_tag=self._list(f.get("exclude_tag")),
             since=f.get("since") or None, before=f.get("before") or None,
             ids=f.get("ids") or None, limit=int(f["limit"]) if f.get("limit") else None)
         for k, v in extra.items():
             setattr(ns, k, v)
         return ns
+
+    def filter_argv(self, f: dict) -> list:
+        """The same filters as command-line flags, for commands that run as a process."""
+        ns, argv = self.filters(f), []
+        for flag, values in (("--company", ns.company), ("--title", ns.title), ("--exclude-company", ns.exclude_company),
+                             ("--exclude-title", ns.exclude_title), ("--tag", ns.tag), ("--exclude-tag", ns.exclude_tag)):
+            for v in values:
+                argv += [flag, v]
+        for flag, value in (("--since", ns.since), ("--before", ns.before), ("--ids", ns.ids), ("--limit", ns.limit)):
+            if value:
+                argv += [flag, str(value)]
+        return argv
 
     def draft_ns(self, b: dict, dry_run: bool):
         campaign = (b.get("campaign") or "").strip()
@@ -132,7 +145,7 @@ class App:
             b.get("filters"), campaign=campaign, template=None, template_text=b["template"],
             brief=None, ai=False, dry_run=dry_run, sender_name=b.get("sender_name") or "",
             var=[f"{k}={v}" for k, v in (b.get("vars") or {}).items()],
-            cooldown_days=int(b.get("cooldown_days") or 30))
+            cooldown_days=int(b.get("cooldown_days") or 30), priority=(b.get("priority") or "").strip() or None)
 
     def start_job(self, kind, target):
         with self.lock:
@@ -267,8 +280,20 @@ class App:
 
     def api_contacts(self, b):
         rows = outreach.select_contacts(self.db(), self.filters(b.get("filters")))
-        return {"contacts": [{k: r[k] for k in ("id", "first_name", "last_name", "position", "company",
-                                                 "connected_on", "url")} for r in rows]}
+        return {"contacts": [{**{k: r[k] for k in ("id", "first_name", "last_name", "position", "company",
+                                                    "connected_on", "url")}, "tags": outreach.tags_of(r)} for r in rows]}
+
+    def api_tag(self, b):
+        spec = (b.get("tags") or "").strip()
+        if not outreach.parse_tag_spec(spec):
+            raise ApiError("List the groups first, one per line, like: founder: started a company")
+        if not outreach.ai_backend_name():
+            raise ApiError("Claude isn't reachable: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.")
+        cmd = self.outreach_cmd("tag", "--tags", spec, *self.filter_argv(b.get("filters")))
+        if b.get("redo"):
+            cmd.append("--redo")
+        self.start_process_job("tagging", cmd)
+        return {"ok": True}
 
     def api_preview(self, b):
         db, ns = self.db(), self.draft_ns(b, dry_run=True)
@@ -378,7 +403,7 @@ class App:
 
     ROUTES = {
         "state": api_state, "import": api_import, "import/linkedin": api_import_linkedin, "contacts": api_contacts,
-        "personalize": api_personalize, "replies": api_replies,
+        "tag": api_tag, "personalize": api_personalize, "replies": api_replies,
         "campaign/delete-drafts": api_delete_drafts, "campaign/delete": api_delete_campaign,
         "preview": api_preview, "draft": api_draft, "messages": api_messages,
         "message": api_update_message, "dnc": api_dnc, "login/start": api_login_start,

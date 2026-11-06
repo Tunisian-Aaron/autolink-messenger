@@ -45,6 +45,42 @@ class OutreachTest(unittest.TestCase):
         names = [r["first_name"] for r in outreach.select_contacts(self.db(), args)]
         self.assertEqual(names, ["Jane"])
 
+    def test_tag_sorts_people_and_filters_and_orders_by_group(self):
+        class Fake:
+            name = "fake"
+            prompts = []
+
+            def generate(self, prompt):
+                self.prompts.append(prompt)
+                ids = [int(x.split(":")[0]) for x in prompt.split("company):\n")[1].split("\n\nReply")[0].splitlines()]
+                groups = {1: ["investor"], 2: ["founder", "travel"], 3: ["engineer"], 4: ["Investor"], 5: ["bogus"]}
+                return "Sure:\n```json\n" + str({str(i): groups.get(i, []) for i in ids}).replace("'", '"') + "\n```"
+
+        self.assertEqual(outreach.parse_tag_spec("founder: started a company\ninvestor\nFounder: dup"),
+                         [("founder", "started a company"), ("investor", "")])
+        self.assertEqual(outreach.parse_tag_spec("Travel, Founder"), [("travel", ""), ("founder", "")])
+        fake = Fake()
+        args = outreach.build_parser().parse_args(["--db", self.dbpath, "tag", "--tags", "investor, founder, travel, engineer"])
+        db = self.db()
+        outreach.cmd_tag(db, args, ai=fake)
+        self.assertEqual(len(fake.prompts), 1)
+        self.assertIn("remote patient monitoring", fake.prompts[0])
+        tags = {r["id"]: outreach.tags_of(r) for r in db.execute("SELECT * FROM contacts")}
+        self.assertEqual(tags, {1: ["investor"], 2: ["founder", "travel"], 3: ["engineer"], 4: ["investor"], 5: []})
+        # already tagged: nothing to do without --redo
+        outreach.cmd_tag(db, args, ai=fake)
+        self.assertEqual(len(fake.prompts), 1)
+        # filters
+        by_tag = outreach.build_parser().parse_args(["list", "--tag", "investor", "--tag", "travel"])
+        self.assertEqual(sorted(r["id"] for r in outreach.select_contacts(db, by_tag)), [1, 2, 4])
+        not_tag = outreach.build_parser().parse_args(["list", "--exclude-tag", "investor"])
+        self.assertEqual(sorted(r["id"] for r in outreach.select_contacts(db, not_tag)), [2, 3, 5])
+        # drafting queues the priority groups first, then everyone else in the usual order
+        self.draft_product("--priority", "founder, investor")
+        order = [r["contact_id"] for r in db.execute("SELECT contact_id FROM messages ORDER BY id")]
+        self.assertEqual(order[:3], [2, 1, 4])  # founder, then investors by connection date
+        self.assertEqual(sorted(order[3:]), [3, 5])
+
     def test_render_fallbacks(self):
         c = self.db().execute("SELECT * FROM contacts WHERE first_name='Tom'").fetchone()
         out = outreach.render("Hi {first_name} at {company|your team}, from {sender_name}", c, {"name": "Sam"})

@@ -137,6 +137,23 @@
   </div>
 
   <div class="card">
+    <h2>Sort people into groups</h2>
+    <p class="hint">Keyword filters misfire ("remote" matches remote patient monitoring). Here Claude reads each headline in context and sorts everyone into groups you define: one per line as <code>name: what it means</code>. Then filter by group below, and on the Write tab put the most important groups first in the queue. <span id="tag-ai-status"></span></p>
+    <textarea id="t-spec" rows="4" placeholder="founder: started or runs a company
+investor: invests in startups (VC, angel, fund)
+engineer: builds software
+other: none of the above"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="btn primary" id="btn-tag">Sort with Claude</button>
+      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="t-redo"> Sort people who already have groups again</label>
+      <button class="btn danger" id="btn-tag-stop" style="display:none">Stop</button>
+      <span class="hint">Uses the filters below, if any are set.</span>
+    </div>
+    <div class="msg" id="tag-msg"></div>
+    <pre class="log" id="tag-log" style="display:none"></pre>
+  </div>
+
+  <div class="card">
     <h2>Choose who to message</h2>
     <p class="hint">Separate several values with commas; any one of them matching counts. These filters decide who gets the campaign you write next.</p>
     <div class="grid">
@@ -144,6 +161,8 @@
       <div><label>Company includes</label><input id="f-company" placeholder="optional"></div>
       <div><label>Title excludes</label><input id="f-exclude_title" placeholder="recruiter, student"></div>
       <div><label>Company excludes</label><input id="f-exclude_company" placeholder="optional"></div>
+      <div><label>In group</label><input id="f-tag" placeholder="founder, investor"></div>
+      <div><label>Not in group</label><input id="f-exclude_tag" placeholder="optional"></div>
       <div><label>Connected since</label><input id="f-since" type="date"></div>
       <div><label>Max people</label><input id="f-limit" type="number" min="1" placeholder="no limit"></div>
     </div>
@@ -165,6 +184,7 @@
       <div><label>Campaign name</label><input id="w-campaign" list="campaign-list" placeholder="e.g. beta-november"></div>
       <div><label>Start from a template</label><select id="w-template-pick"></select></div>
       <div><label>Your name (signs the message)</label><input id="w-sender"></div>
+      <div><label>Send first to (groups, in order)</label><input id="w-priority" placeholder="e.g. investor, founder"></div>
     </div>
     <div style="margin-top:12px">
       <label>Message - click to insert a field at the cursor</label>
@@ -328,7 +348,7 @@ function renderStats() {
 }
 
 // ---------- contacts ----------
-const FILTERS = ['title', 'company', 'exclude_title', 'exclude_company', 'since', 'limit'];
+const FILTERS = ['title', 'company', 'exclude_title', 'exclude_company', 'tag', 'exclude_tag', 'since', 'limit'];
 function filters() { const f = {}; FILTERS.forEach(k => f[k] = $('f-' + k).value.trim()); return f; }
 FILTERS.forEach(k => { $('f-' + k).value = store.get('f-' + k, ''); $('f-' + k).oninput = () => store.set('f-' + k, $('f-' + k).value); });
 
@@ -344,14 +364,20 @@ $('btn-import-li').onclick = () => guard($('btn-import-li'), async () => {
 }, 'import-li-msg');
 $('btn-import-li-stop').onclick = () => api('stop');
 
+$('t-spec').value = store.get('tag-spec', ''); $('t-spec').oninput = () => store.set('tag-spec', $('t-spec').value);
+$('btn-tag').onclick = () => guard($('btn-tag'), async () => {
+  hide('tag-msg'); await api('tag', { tags: $('t-spec').value, redo: $('t-redo').checked, filters: filters() }); startPolling();
+}, 'tag-msg');
+$('btn-tag-stop').onclick = () => api('stop');
+
 async function search() {
   const r = await api('contacts', { filters: filters() });
   $('search-count').textContent = `${r.contacts.length} people match`;
-  $('contacts-table').innerHTML = '<tr><th>Name</th><th>Title</th><th>Company</th><th>Connected</th><th></th></tr>' +
+  $('contacts-table').innerHTML = '<tr><th>Name</th><th>Title</th><th>Company</th><th>Groups</th><th>Connected</th><th></th></tr>' +
     (r.contacts.slice(0, 500).map(c => `<tr><td>${c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.first_name)} ${esc(c.last_name)}</a>` : esc(c.first_name + ' ' + c.last_name)}</td>
-      <td>${esc(c.position)}</td><td>${esc(c.company)}</td><td>${esc(c.connected_on || '')}</td>
+      <td>${esc(c.position)}</td><td>${esc(c.company)}</td><td>${esc((c.tags || []).join(', '))}</td><td>${esc(c.connected_on || '')}</td>
       <td><button class="btn small" data-dnc="${c.id}">Never contact</button></td></tr>`).join('')
-     || `<tr><td colspan="5" class="empty">${state && state.contacts ? 'Nobody matches these filters.' : 'Import your connections above to get started.'}</td></tr>`);
+     || `<tr><td colspan="6" class="empty">${state && state.contacts ? 'Nobody matches these filters.' : 'Import your connections above to get started.'}</td></tr>`);
   if (r.contacts.length > 500) $('search-count').textContent += ' (showing first 500)';
 }
 $('contacts-table').onclick = async (e) => {
@@ -393,10 +419,11 @@ function vars() { const v = {}; document.querySelectorAll('[data-var]').forEach(
 $('w-template').oninput = onTemplate;
 ['w-campaign', 'w-sender'].forEach(id => { $(id).value = store.get(id, ''); $(id).oninput = () => store.set(id, $(id).value); });
 $('w-template').value = store.get('template', ''); onTemplate();
+$('w-priority').value = store.get('priority', ''); $('w-priority').oninput = () => store.set('priority', $('w-priority').value);
 
 function draftBody() {
   return { campaign: $('w-campaign').value.trim(), template: $('w-template').value,
-           sender_name: $('w-sender').value.trim(), vars: vars(), filters: filters() };
+           sender_name: $('w-sender').value.trim(), priority: $('w-priority').value.trim(), vars: vars(), filters: filters() };
 }
 function updateAudience() {
   const f = filters(), parts = [];
@@ -404,6 +431,8 @@ function updateAudience() {
   if (f.company) parts.push(`company includes ${f.company}`);
   if (f.exclude_title) parts.push(`title excludes ${f.exclude_title}`);
   if (f.exclude_company) parts.push(`company excludes ${f.exclude_company}`);
+  if (f.tag) parts.push(`in group ${f.tag}`);
+  if (f.exclude_tag) parts.push(`not in group ${f.exclude_tag}`);
   if (f.since) parts.push(`connected since ${f.since}`);
   if (f.limit) parts.push(`at most ${f.limit} people`);
   $('audience-note').innerHTML = 'Audience: ' + (parts.length ? esc(parts.join('; ')) : '<b>all your connections</b>') +
@@ -523,18 +552,19 @@ function renderJob() {
   if (j) { const log = $('log'), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
            log.textContent = (j.log || '...').replace(/Failed messages are marked[^\n]*/,
              'Failed messages are on the Review tab (Show: Failed), where you can put them back in the queue.'); if (atEnd) log.scrollTop = log.scrollHeight; }
-  const importing = j && j.kind === 'LinkedIn import', personalizing = j && j.kind === 'personalizing';
-  for (const [flag, logId] of [[importing, 'import-log'], [personalizing, 'personalize-log']]) {
+  const importing = j && j.kind === 'LinkedIn import', personalizing = j && j.kind === 'personalizing', tagging = j && j.kind === 'tagging';
+  for (const [flag, logId] of [[importing, 'import-log'], [personalizing, 'personalize-log'], [tagging, 'tag-log']]) {
     $(logId).style.display = flag ? '' : 'none';
     if (flag) { $(logId).textContent = j.log || '...'; $(logId).scrollTop = $(logId).scrollHeight; }
   }
-  $('btn-stop').style.display = running && !importing && !personalizing ? '' : 'none';
+  $('btn-stop').style.display = running && !importing && !personalizing && !tagging ? '' : 'none';
   $('btn-import-li-stop').style.display = running && importing ? '' : 'none';
+  $('btn-tag-stop').style.display = running && tagging ? '' : 'none';
   $('btn-personalize-stop').style.display = running && personalizing ? '' : 'none';
-  ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize', 'btn-replies'].forEach(id => $(id).disabled = !!running);
-  $('ai-status').textContent = state.ai ? `Using ${state.ai}.` : 'Claude isn\'t reachable yet: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.';
+  ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize', 'btn-replies', 'btn-tag'].forEach(id => $(id).disabled = !!running);
+  $('ai-status').textContent = $('tag-ai-status').textContent = state.ai ? `Using ${state.ai}.` : 'Claude isn\'t reachable yet: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.';
   if (!running && polling) { clearInterval(polling); polling = null;
-    if (store.get('tab') === 'review') loadMessages(); if (importing) search().catch(() => {}); }
+    if (store.get('tab') === 'review') loadMessages(); if (importing || tagging) search().catch(() => {}); }
 }
 function startPolling() { if (!polling) polling = setInterval(() => refresh().catch(() => {}), 1500); refresh(); }
 

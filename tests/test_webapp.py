@@ -55,6 +55,18 @@ class WebAppTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/") as r:
             self.assertIn(b"AutoLink Messenger", r.read())
 
+    def test_tag_filters_and_route_validation(self):
+        db = self.app.db()
+        db.execute("UPDATE contacts SET tags=',investor,' WHERE id=1")
+        db.commit()
+        _, r = self.post("contacts", {"filters": {"tag": "investor"}})
+        self.assertEqual([c["tags"] for c in r["contacts"]], [["investor"]])
+        self.assertEqual(self.app.filter_argv({"tag": "a, b", "limit": "5", "title": "cto"}),
+                         ["--title", "cto", "--tag", "a", "--tag", "b", "--limit", "5"])
+        status, r = self.post("tag", {"tags": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("one per line", r["error"])
+
     def test_blank_fields_block_drafting(self):
         status, r = self.post("preview", self.draft_body(product=""))
         self.assertEqual(status, 400)

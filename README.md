@@ -100,6 +100,29 @@ There are also `--exclude-title`, `--exclude-company`, `--since`, `--before`,
 `--ids 4,9,12` and `--limit`. Mark people never to contact with
 `python outreach.py dnc 12,40`.
 
+### Sorting people into groups with Claude
+
+Keyword filters misfire: `--title remote` matches "remote patient monitoring",
+and a "Founder" of a bakery and a "Founding Engineer" look alike. `tag` has
+Claude read each headline in context and sort people into groups you define,
+25 people per call (a network of 5,000 takes about 15 minutes and costs cents):
+
+```bash
+python outreach.py tag --tags "founder: started or runs a company
+investor: invests in startups (VC, angel, fund)
+travel: works in travel, tourism or hospitality
+engineer: builds software"
+python outreach.py list --tag investor --tag founder      # has either group
+python outreach.py draft beta --template t.txt --priority investor,founder   # queue them first
+```
+
+Someone can be in several groups or none. People already sorted are skipped
+unless you pass `--redo`; the usual filters narrow who gets sorted. `--tag` and
+`--exclude-tag` work on every command that takes filters, and `draft
+--priority` puts the groups you name at the front of the queue, in that order,
+so a daily cap reaches the important people first. On the web page this is the
+*Sort people into groups* card on the Contacts tab.
+
 ## 3. Draft a campaign
 
 Templates are plain text files. Placeholders are filled from each contact:
@@ -150,6 +173,16 @@ python outreach.py review beta-oct          # read every message before sending
 in the database, so running again only reads new people. Messages already
 personalized are left alone unless you pass `--redo`. If Claude fails on one
 message, that draft keeps its template text and the rest continue.
+
+Every rewrite is checked before it is kept. Free checks first: each link in
+the template must appear unchanged, the sign-off must be identical, the first
+line must still greet the person, no placeholder or preamble, and the length
+rule. When those pass, one short extra Claude call lists any statement about
+the person the profile doesn't support. A rewrite with a problem gets one
+retry with the problems spelled out; if that still fails, the template text is
+used and the reason is printed (`! Jane Doe: using the template text; the
+rewrite says something the profile doesn't support: ...`). The same checks run
+when `autosend --personalize` rewrites a message just before sending it.
 
 Claude is reached one of two ways, whichever is available:
 

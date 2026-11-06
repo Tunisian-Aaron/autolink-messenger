@@ -4,6 +4,7 @@ The browser tests run a real headless browser and are skipped when Playwright is
 installed. Nothing here contacts LinkedIn or Claude.
 """
 
+import re
 import sys
 import tempfile
 import threading
@@ -81,7 +82,11 @@ class FakeClaude:
         self.prompts.append(prompt)
         if self.fail:
             raise RuntimeError("quota")
-        return self.replies.pop(0) if self.replies else self.reply
+        if "Reply with exactly NONE" in prompt and not self.replies:  # the grounding check
+            return "NONE"
+        reply = self.replies.pop(0) if self.replies else self.reply
+        first = re.search(r"Name: (\S+)", prompt)  # "{first}" greets whoever the prompt is about
+        return reply.replace("{first}", first.group(1)) if reply and first else reply
 
 
 class PromptTest(unittest.TestCase):
@@ -94,19 +99,59 @@ class PromptTest(unittest.TestCase):
             self.assertIn(needle, p)
         self.assertIn("unknown", outreach.personalization_prompt("x", {**contact, "company": ""}, "g", None))
 
-    def test_over_long_result_gets_one_cut(self):
-        contact = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
-        base = "Hi Jane, " + "word " * 20
-        long = "Hi Jane, " + "word " * 40
-        ai = FakeClaude(replies=[long, "Hi Jane, short."])
-        self.assertEqual(outreach.personalize(ai, base, contact, "g"), "Hi Jane, short.")
+    def test_cheap_checks_catch_what_a_rewrite_must_keep(self):
+        base = "Hi Jane,\n\nTry it at demo.example.com or https://cal.com/sam/15 today.\n\nSam"
+        jane = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
+        self.assertEqual(outreach.rewrite_problems(base, "Hi Jane,\n\nYou at Acme: demo.example.com, "
+                                                         "https://cal.com/sam/15.\n\nSam", jane), [])
+        problems = outreach.rewrite_problems(
+            base, "Here's the message:\n\nHello there,\n\nSee demo.example.org, https://cal.com/sam/15 {company}.\n\nSamuel", jane)
+        for needle in ("link demo.example.com", "sign-off must stay exactly 'Sam'", "greet Jane", "placeholder", "preamble"):
+            self.assertTrue(any(needle in p for p in problems), (needle, problems))
+        self.assertIn("words", outreach.rewrite_problems("Hi Jane, " + "w " * 20, "Hi Jane, " + "w " * 40, jane)[0])
+        # names with symbols are greeted by their letters; no sign-off line means no sign-off check
+        self.assertEqual(outreach.rewrite_problems("Hi Mine,\n\nText that is long enough here.", "Hi Mine,\n\nOther text.",
+                                                   {"first_name": "\u2728Mine"}), [])
+
+    def test_grounding_check_parses_claims(self):
+        jane = {"first_name": "Jane", "last_name": "Doe", "position": "Partner", "company": "Acme"}
+        self.assertEqual(outreach.unsupported_claims(FakeClaude(replies=["NONE"]), "msg", jane), [])
+        self.assertEqual(outreach.unsupported_claims(FakeClaude(replies=["None."]), "msg", jane), [])
+        claims = outreach.unsupported_claims(FakeClaude(replies=["- she lived in Lisbon\n* we met at Web Summit"]), "msg", jane)
+        self.assertEqual(claims, ["she lived in Lisbon", "we met at Web Summit"])
+
+    def test_personalize_retries_once_then_falls_back_to_the_template(self):
+        jane = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
+        base = "Hi Jane,\n\nTry https://x.io when you can, and tell me.\n\nSam"
+        good = "Hi Jane,\n\nAs a partner, try https://x.io and tell me.\n\nSam"
+
+        # passes first time: rewrite + grounding check = 2 calls
+        ai = FakeClaude(replies=[good, "NONE"])
+        self.assertEqual(outreach.personalize(ai, base, jane, "g"), (good, ""))
         self.assertEqual(len(ai.prompts), 2)
+        self.assertIn("Known facts:", ai.prompts[1])
+
+        # link dropped: retry with the problem named, retry passes
+        ai = FakeClaude(replies=[good.replace("https://x.io", "x.io"), good, "NONE"])
+        self.assertEqual(outreach.personalize(ai, base, jane, "g"), (good, ""))
+        self.assertIn("link https://x.io is missing", ai.prompts[1])
+        self.assertEqual(len(ai.prompts), 3)
+
+        # invented fact: retry still invents -> template text, with the reason
+        ai = FakeClaude(replies=[good, "she lived in Lisbon", good, "she lived in Lisbon"])
+        text, note = outreach.personalize(ai, base, jane, "g")
+        self.assertEqual(text, base)
+        self.assertIn("doesn't support: she lived in Lisbon", note)
+        self.assertIn("Fix every problem", ai.prompts[2])
+
+        # over-long then cut: the old length rule still holds
+        long = "Hi Jane,\n\n" + "word " * 40 + "https://x.io\n\nSam"
+        ai = FakeClaude(replies=[long, good, "NONE"])
+        self.assertEqual(outreach.personalize(ai, base, jane, "g")[0], good)
         self.assertIn("the limit is", ai.prompts[1])
-        ai = FakeClaude(replies=[long, long + "more"])  # the cut didn't help: keep the shorter one
-        self.assertEqual(outreach.personalize(ai, base, contact, "g"), long.strip())
-        ai = FakeClaude(reply="Hi Jane, fine.")  # within the limit: one call only
-        outreach.personalize(ai, base, contact, "g")
-        self.assertEqual(len(ai.prompts), 1)
+
+        # Claude declines
+        self.assertEqual(outreach.personalize(FakeClaude(reply=None), base, jane, "g")[0], base)
 
 
 @unittest.skipUnless(HAVE_PW, "playwright not installed")
@@ -166,13 +211,13 @@ class EnrichPersonalizeTest(unittest.TestCase):
         self.assertEqual(n, 0)  # already read
 
     def test_personalize_rewrites_waiting_drafts_and_keeps_template_on_failure(self):
-        ai = FakeClaude(reply="Hi Jane,\n\nPersonal version.\n\nSam")
+        ai = FakeClaude(reply="Hi {first},\n\nPersonal version.\n\nSam")
         outreach.cmd_personalize(self.db, self.args("personalize", "c", "--brief", "Get feedback", "--enrich"),
                                  ai=ai, page_factory=self.page_factory, sleep=lambda s: None)
         msgs = outreach.campaign_messages(self.db, "c", "draft")
-        self.assertEqual([m["body"] for m in msgs], ["Hi Jane,\n\nPersonal version.\n\nSam"] * 2)
+        self.assertEqual([m["body"] for m in msgs], [f"Hi {m['first_name']},\n\nPersonal version.\n\nSam" for m in msgs])
         self.assertTrue(all(m["ai_at"] for m in msgs))
-        self.assertEqual(len(ai.prompts), 2)
+        self.assertEqual(len(ai.prompts), 4)  # a rewrite and a grounding check per message
         self.assertIn("Early-stage investor", ai.prompts[0])  # the enriched profile reached Claude
         self.assertIn("Get feedback", ai.prompts[0])
         self.assertEqual(self.db.execute("SELECT brief FROM campaigns").fetchone()[0], "Get feedback")
@@ -183,7 +228,7 @@ class EnrichPersonalizeTest(unittest.TestCase):
         self.assertEqual(ai2.prompts, [])
 
         # --redo starts from the template text again, not from the last rewrite
-        ai3 = FakeClaude(reply="Hi Jane,\n\nAgain.\n\nSam")
+        ai3 = FakeClaude(reply="Hi {first},\n\nAgain.\n\nSam")
         outreach.cmd_personalize(self.db, self.args("personalize", "c", "--redo"), ai=ai3)
         self.assertIn("Hope all is well at", ai3.prompts[0])  # the template text
         self.assertNotIn("Personal version", ai3.prompts[0])

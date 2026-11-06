@@ -5,6 +5,7 @@ OUTREACH_BROWSER_PATH if Playwright's bundled Chromium isn't installed.
 """
 
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -213,7 +214,9 @@ class AutosendTest(unittest.TestCase):
 
             def generate(self, prompt):
                 self.prompts.append(prompt)
-                return "Hi there,\n\nPersonal.\n\nSam"
+                if "Reply with exactly NONE" in prompt:  # the check for invented facts
+                    return "NONE"
+                return "Hi %s,\n\nPersonal.\n\nSam" % re.search(r"Name: (\S+)", prompt).group(1)
         db, ids = self.point_contacts(["ok1", "ok2"])
         db.execute("UPDATE campaigns SET brief='Get feedback'")
         db.commit()
@@ -223,8 +226,9 @@ class AutosendTest(unittest.TestCase):
              "--personalize", "--profile-dir", str(Path(self.tmp.name) / "profile"),
              "--screenshots", str(Path(self.tmp.name) / "shots")])
         outreach.cmd_autosend(db, args, sleep=lambda s: None, ai=ai)
-        self.assertEqual([s["text"] for s in Handler.sent], ["Hi there,\n\nPersonal.\n\nSam"] * 2)
-        self.assertEqual(len(ai.prompts), 2)
+        self.assertEqual(sorted(s["text"] for s in Handler.sent),
+                         sorted(f"Hi {m['first_name']},\n\nPersonal.\n\nSam" for m in outreach.campaign_messages(db, "c", "sent")))
+        self.assertEqual(len(ai.prompts), 4)  # a rewrite and a check for invented facts per message
         self.assertIn("Ten years in", ai.prompts[0])  # the profile was read first
         self.assertIn("Something at Somewhere", ai.prompts[0])
         self.assertEqual(db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0], 2)
