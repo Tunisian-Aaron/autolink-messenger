@@ -67,6 +67,7 @@
   .preview { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-top: 10px; }
   .preview .who { font-weight: 600; } .preview .sub { color: var(--muted); font-size: 13px; }
   .preview pre, .mcard pre { white-space: pre-wrap; font: inherit; margin: 8px 0 0; }
+  .thread { margin: 8px 0 0; color: var(--muted, #666); font-size: 13px; } .thread pre { margin: 4px 0 0; padding-left: 10px; border-left: 2px solid #ddd; }
   .mcard { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-top: 10px; }
   .mhead { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
   .mhead .who { font-weight: 600; } .mhead .sub { color: var(--muted); font-size: 13px; margin-right: auto; }
@@ -490,6 +491,7 @@ async function loadMessages(more) {
       <div class="mhead"><span class="who">${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.first_name)} ${esc(m.last_name)}</a>` : esc(m.first_name + ' ' + m.last_name)}</span>
         <span class="sub">${esc([m.position, m.company].filter(Boolean).join(' @ '))}</span>
         <span class="badge b-${m.status}">${m.status === 'draft' ? 'waiting' : m.status}</span>${m.ai_at ? '<span class="badge b-draft" title="Rewritten by Claude from their profile">personalized</span>' : ''}</div>
+      ${m.thread ? `<details class="thread"><summary>Earlier conversation with ${esc(m.first_name)}</summary><pre>${esc(m.thread)}</pre></details>` : ''}
       ${draft ? `<textarea>${esc(m.body)}</textarea>` : `<pre>${esc(m.body)}</pre>`}
       ${m.error ? `<div class="err-note">${esc(m.error)}</div>` : ''}
       <div class="row">${actions}<button class="btn small danger" data-act="dnc">Never contact</button></div></div>`;

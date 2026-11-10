@@ -53,7 +53,25 @@ SEND_BUTTON = [
     ("css", "button.msg-form__send-button"),
     ("role", "button", r"^send$"),
 ]
+# With LinkedIn's "Press Enter to Send" setting on, the Send button isn't rendered at all and
+# this hint sits where it was (seen 2026-11-08).
+ENTER_TO_SEND = [("text", r"press enter to send")]
 CLOSE_OVERLAY = "button[aria-label*='Close your conversation'], button[aria-label*='Close your draft']"
+# The conversation above the composer: a date heading per day, then one list item per message,
+# the sender's name only on the first of a run of messages from the same person.
+THREAD_JS = """() => {
+  const out = [];
+  let who = '', day = '';
+  for (const item of document.querySelectorAll('[class*="message-list__time-heading"], .msg-s-event-listitem, [class*="msg-s-event-listitem"]')) {
+    if (/time-heading/.test(item.className)) { day = item.innerText.trim(); continue; }
+    const name = item.querySelector('.msg-s-message-group__name, [class*="message-group__name"]');
+    if (name && name.innerText.trim()) who = name.innerText.trim();
+    const body = item.querySelector('.msg-s-event-listitem__body, [class*="event-listitem__body"]');
+    const text = body ? body.innerText.trim() : '';
+    if (text && !out.some(m => m.who === who && m.text === text)) out.push({who, text, day});
+  }
+  return out;
+}"""
 
 # Connections list (import-linkedin). The page loads 10 people at a time through a
 # "pager" request whose body is fixed apart from startIndex, so once we've seen the page
@@ -96,6 +114,14 @@ class SendError(Exception):
     """This one message couldn't be sent; the run can continue."""
 
 
+class NotReachable(SendError):
+    """You can't message this person at all (not a 1st-degree connection): retrying won't help."""
+
+
+class Unconfirmed(SendError):
+    """Send was pressed but LinkedIn never confirmed it: never retry, or they may get it twice."""
+
+
 @contextlib.contextmanager
 def browser(profile_dir: str = DEFAULT_PROFILE_DIR, headless: bool = False, channel: str | None = None):
     try:
@@ -128,17 +154,25 @@ class LinkedInSender:
         for spec in specs:
             if spec[0] == "role":
                 yield self.page.get_by_role(spec[1], name=re.compile(spec[2], re.I))
+            elif spec[0] == "text":
+                yield self.page.get_by_text(re.compile(spec[1], re.I))
             else:
                 yield self.page.locator(spec[1])
+
+    def _visible_now(self, specs):
+        for loc in self._locators(specs):
+            for i in range(min(loc.count(), 5)):
+                item = loc.nth(i)
+                if item.is_visible():
+                    return item
+        return None
 
     def _first_visible(self, specs, what: str, timeout_s: float | None = None):
         deadline = time.monotonic() + (timeout_s or self.timeout_s)
         while time.monotonic() < deadline:
-            for loc in self._locators(specs):
-                for i in range(min(loc.count(), 5)):
-                    item = loc.nth(i)
-                    if item.is_visible():
-                        return item
+            item = self._visible_now(specs)
+            if item is not None:
+                return item
             time.sleep(0.25)
         raise SendError(f"couldn't find the {what}")
 
@@ -159,7 +193,7 @@ class LinkedInSender:
         with contextlib.suppress(Exception):  # no badge found: let the Message lookup decide
             degrees = set(DEGREE_BADGE.findall(top_card(main_lines(self.page))["degree"]))
         if degrees and "1st" not in degrees:
-            raise SendError(f"not a 1st-degree connection ({', '.join(sorted(degrees))})")
+            raise NotReachable(f"not a 1st-degree connection ({', '.join(sorted(degrees))})")
 
     # -- public --------------------------------------------------------------
     def check_blocked(self):
@@ -176,8 +210,15 @@ class LinkedInSender:
                               "account in the browser before sending more.")
 
     def send(self, profile_url: str, body: str, dry_run: bool = False):
+        self.open(profile_url)
+        self.send_text(body, dry_run=dry_run)
+
+    def open(self, profile_url: str) -> list[dict]:
+        """Open the conversation with this person from their profile. Returns the messages
+        already in it, oldest first, as {"who": sender name, "text": ..., "day": LinkedIn's date
+        heading, e.g. "OCT 6" or "TODAY"} (empty when the thread is new or the page shows none)."""
         if not profile_url:
-            raise SendError("contact has no profile URL")
+            raise NotReachable("contact has no profile URL")
         self.page.goto(profile_url, wait_until="domcontentloaded")
         self.check_blocked()
         self._close_overlays()
@@ -191,7 +232,23 @@ class LinkedInSender:
             self.check_blocked()
         else:
             btn.click()
-        box = self._first_visible(COMPOSER, "message box")
+        self._box = self._first_visible(COMPOSER, "message box")
+        return self.thread()
+
+    def thread(self, settle_s: float = 2.0) -> list[dict]:
+        """Earlier messages in the open conversation. Waits briefly for them to render."""
+        deadline = time.monotonic() + settle_s
+        found = []
+        while True:
+            with contextlib.suppress(Exception):
+                found = self.page.evaluate(THREAD_JS) or []
+            if found or time.monotonic() >= deadline:
+                return found
+            time.sleep(0.25)
+
+    def send_text(self, body: str, dry_run: bool = False):
+        """Type and send into the conversation opened by `open`."""
+        box = self._box
         box.click()
         self._clear_focused()
         # Type line breaks as Shift+Enter, like a person: it never triggers LinkedIn's
@@ -207,25 +264,45 @@ class LinkedInSender:
             self._close_overlays()
             return
 
-        # LinkedIn enables Send a moment after the text lands; give it a few seconds.
-        send_btn = self._first_visible(SEND_BUTTON, "Send button")
-        deadline = time.monotonic() + 5
-        while not send_btn.is_enabled() and time.monotonic() < deadline:
-            time.sleep(0.25)
-        if not send_btn.is_enabled():
-            raise SendError("Send button stayed disabled after typing the message")
-        send_btn.click()
+        try:
+            if self._visible_now(ENTER_TO_SEND):
+                time.sleep(0.5)  # let LinkedIn register the text; the box still has focus
+                self.page.keyboard.press("Enter")
+            else:
+                # LinkedIn enables Send a moment after the text lands; give it a few seconds.
+                send_btn = self._first_visible(SEND_BUTTON, "Send button")
+                deadline = time.monotonic() + 5
+                while not send_btn.is_enabled() and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                if not send_btn.is_enabled():
+                    raise SendError("Send button stayed disabled after typing the message")
+                send_btn.click()
+        except SendError:
+            # Nothing went out, so don't leave the text behind as a LinkedIn draft.
+            with contextlib.suppress(Exception):
+                box.click()
+                self._clear_focused()
+                self._close_overlays()
+            raise
 
-        # LinkedIn empties the composer once the message is accepted.
+        # LinkedIn empties the composer once the message is accepted. When it's slow (a "Sending..."
+        # spinner that lingers), the message showing up in the conversation proves it too.
+        snippet = " ".join(max(body.split("\n"), key=len).split())[:60]
         deadline = time.monotonic() + self.confirm_timeout_s
         while time.monotonic() < deadline:
-            if not box.inner_text().strip():
+            if not box.inner_text().strip() or self._in_thread(snippet):
                 self.check_blocked()
                 self._close_overlays()
                 return
-            time.sleep(0.25)
-        raise SendError("clicked Send but couldn't confirm the message went out - check the "
+            time.sleep(0.5)
+        raise Unconfirmed("clicked Send but couldn't confirm the message went out - check the "
                         "conversation in LinkedIn before retrying")
+
+    def _in_thread(self, snippet: str) -> bool:
+        with contextlib.suppress(Exception):
+            return bool(snippet) and any(snippet in " ".join(m["text"].split())
+                                         for m in self.page.evaluate(THREAD_JS))
+        return False
 
     def screenshot(self, path: str):
         with contextlib.suppress(Exception):
@@ -327,6 +404,9 @@ MESSAGING_URL = "https://www.linkedin.com/messaging/"
 # that starts with "You:" when the last message is ours.
 INBOX_LIST = "ul.msg-conversations-container__conversations-list, [class*='conversations-list']"
 INBOX_ITEM = "li"
+# Lines in a conversation row that aren't the name, time or preview: the presence badge that now
+# comes first ("Status is online"), the unread count and screen-reader hints.
+INBOX_NOISE = re.compile(r"^(status is \w+|\. .*|open the options list.*|\d+ new notifications?|\d+)$", re.I)
 INBOX_WHEN = re.compile(r"^(\d{1,2}:\d{2}\s*[AP]M|[A-Z][a-z]{2} \d{1,2}(, \d{4})?|Yesterday|[A-Z][a-z]+day)$")
 
 
@@ -344,12 +424,12 @@ def read_inbox(page, url: str = MESSAGING_URL, limit: int = 150) -> list[dict]:
         }""", [INBOX_LIST, INBOX_ITEM])
         before = len(seen)
         for lines in items:
+            lines = [l for l in lines if not INBOX_NOISE.match(l)]
             if len(lines) < 2:
                 continue
             name = lines[0]
             when = next((l for l in lines[1:4] if INBOX_WHEN.match(l)), "")
-            preview = next((l for l in lines[1:] if l != when and not INBOX_WHEN.match(l)
-                            and not re.match(r"^\d+$", l)), "")
+            preview = next((l for l in lines[1:] if l != when and not INBOX_WHEN.match(l)), "")
             if name not in seen:
                 seen[name] = {"name": name, "when": when, "preview": preview,
                               "from_me": preview.lower().startswith("you:")}
@@ -385,10 +465,24 @@ def wait_for_login(page, cancelled=lambda: False, timeout_s=900) -> bool:
     return True
 
 
+def goto_patiently(page, url: str, tries: int = 3, pause_ms: int = 5000):
+    """page.goto that rides out LinkedIn's occasional slow minute instead of crashing the run."""
+    for attempt in range(tries):
+        try:
+            return page.goto(url, wait_until="domcontentloaded")
+        except Exception as e:
+            if type(e).__name__ != "TimeoutError":
+                raise
+            if attempt == tries - 1:
+                raise StopRun(f"LinkedIn didn't load {url} after {tries} tries - check your connection "
+                              "and run again.") from None
+            page.wait_for_timeout(pause_ms)
+
+
 def ensure_logged_in(page, url: str, cancelled=lambda: False):
     """Open url. If LinkedIn shows a login wall instead, wait for you to log in, then retry."""
     for _ in range(3):
-        page.goto(url, wait_until="domcontentloaded")
+        goto_patiently(page, url)
         if logged_in(page):
             return
         if not wait_for_login(page, cancelled):

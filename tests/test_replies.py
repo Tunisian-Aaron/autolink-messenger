@@ -21,11 +21,25 @@ except ImportError:
 
 INBOX = """<!doctype html><html><head><meta charset="utf-8"></head><body><main>
 <ul class="msg-conversations-container__conversations-list">
-<li><div>Jane Doe</div><time>4:46 PM</time><p>Jane: Thanks, will try it this weekend!</p></li>
-<li><div>Raj Patel</div><time>Nov 3</time><p>You: Hi Raj, Hope all is well</p></li>
+<li><span>Status is online</span><div>Jane Doe</div><time>4:46 PM</time><p>Jane: Thanks, will try it this…</p>
+  <span>1</span><span>1 new notification</span><span>. Press return to go to conversation details</span></li>
+<li><span>Status is online</span><div>Raj Patel</div><time>Nov 3</time><p>You: Hi Raj, Hope all is well</p></li>
 <li><div>Ana Silva</div><time>Jan 2, 2020</time><p>Ana: an old thread from years ago</p><span>1</span></li>
 <li><div>Someone Else</div><time>Nov 1</time><p>Someone: unrelated</p></li>
 </ul></main></body></html>"""
+
+
+# Jane's profile and her conversation: her reply is two messages, longer than the inbox preview.
+PROFILE = """<!doctype html><html><body><main><div><h1>Jane Doe</h1><span>· 1st</span></div>
+<a href="/messaging/compose/?recipient=jane">Message</a></main></body></html>"""
+CONVO = """<!doctype html><html><body><main><h2>New message</h2>
+<div class="msg-s-event-listitem"><span class="msg-s-message-group__name">Sam Sender</span>
+  <p class="msg-s-event-listitem__body">Hi Jane, try it when you can.</p></div>
+<div class="msg-s-event-listitem"><span class="msg-s-message-group__name">Jane Doe</span>
+  <p class="msg-s-event-listitem__body">Thanks, will try it this weekend!</p></div>
+<div class="msg-s-event-listitem"><p class="msg-s-event-listitem__body">One thing: the map is slow.</p></div>
+<div class="msg-form__contenteditable" contenteditable="true" role="textbox" aria-label="Write a message…"></div>
+</main></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -33,10 +47,11 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        page = PROFILE if self.path.startswith("/in/") else CONVO if "/compose/" in self.path else INBOX
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(INBOX.encode())
+        self.wfile.write(page.encode())
 
 
 class WhenTest(unittest.TestCase):
@@ -71,7 +86,7 @@ class DbTest(unittest.TestCase):
         self.mark_sent("Jane")
         self.mark_sent("Raj")
         self.mark_sent("Ana")
-        inbox = [{"name": "Jane Doe", "when": "4:46 PM", "preview": "Jane: Thanks, will try it!", "from_me": False},
+        inbox = [{"name": "Jane Doe, PhD", "when": "4:46 PM", "preview": "Jane: Thanks, will try it!", "from_me": False},
                  {"name": "Raj Patel", "when": "Nov 3", "preview": "You: Hi Raj", "from_me": True},
                  {"name": "Ana Silva", "when": "Jan 2, 2020", "preview": "Ana: old thread", "from_me": False}]
         n = outreach.cmd_replies(self.db, None, inbox=inbox)
@@ -109,6 +124,8 @@ class InboxBrowserTest(DbTest):
     def test_read_inbox_and_mark(self):
         self.mark_sent("Jane")
         self.mark_sent("Raj")
+        self.db.execute("UPDATE contacts SET url=? WHERE first_name='Jane'", (self.base + "/in/jane",))
+        self.db.commit()
         args = outreach.build_parser().parse_args(
             ["--db", self.dbpath, "replies", "--headless", "--url", self.base + "/messaging/",
              "--profile-dir", str(Path(self.tmp.name) / "profile")])
@@ -117,6 +134,9 @@ class InboxBrowserTest(DbTest):
         st = {r["first_name"]: r["status"] for r in self.db.execute(
             "SELECT c.first_name, m.status FROM messages m JOIN contacts c ON c.id=m.contact_id")}
         self.assertEqual((st["Jane"], st["Raj"]), ("replied", "sent"))
+        # the conversation was opened for the whole reply, not the inbox's cut-off line
+        reply = self.db.execute("SELECT reply FROM messages WHERE status='replied'").fetchone()[0]
+        self.assertEqual(reply, "Thanks, will try it this weekend!\nOne thing: the map is slow.")
 
 
 if __name__ == "__main__":

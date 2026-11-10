@@ -99,6 +99,59 @@ class PromptTest(unittest.TestCase):
             self.assertIn(needle, p)
         self.assertIn("unknown", outreach.personalization_prompt("x", {**contact, "company": ""}, "g", None))
 
+    def test_prompt_lists_earlier_openers_so_they_are_not_reused(self):
+        contact = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
+        self.assertEqual(outreach.opener("Hi Jane,\n\nYou run Acme, so...\n\nSam"), "You run Acme, so...")
+        self.assertEqual(outreach.opener("One line only"), "One line only")
+        p = outreach.personalization_prompt("Hi Jane,\n\nDraft.", contact, "g", None,
+                                            ["You've spent years on X.", "From A to B, you..."])
+        self.assertIn("Openers already used", p)
+        self.assertIn("- From A to B, you...", p)
+        self.assertNotIn("Openers already used", outreach.personalization_prompt("x", contact, "g", None))
+
+    def test_thread_text_names_sides_and_reaches_the_prompt(self):
+        jane = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
+        thread = [{"who": "Sam Sender", "text": "Hi Jane,\n\nlong  spaced   text"},
+                  {"who": "Jane Doe", "text": "Thanks Sam!"},
+                  {"who": "Jane", "text": "x" * 500}, {"who": "", "text": ""}]
+        text = outreach.thread_text(thread, jane)
+        self.assertEqual(text.splitlines()[:2], ["You: Hi Jane, long spaced text", "Jane: Thanks Sam!"])
+        self.assertEqual(len(text.splitlines()[2]), len("Jane: ") + outreach.THREAD_CHARS)
+        self.assertEqual(outreach.thread_text([], jane), "")
+        dated = [{"who": "Sam Sender", "text": "Dinner tomorrow?", "day": "OCT 6"},
+                 {"who": "Jane Doe", "text": "Sure", "day": "OCT 6"},
+                 {"who": "Jane Doe", "text": "Which place?", "day": "TODAY"}]
+        self.assertEqual(outreach.thread_text(dated, jane).splitlines(),
+                         ["[Oct 6]", "You: Dinner tomorrow?", "Jane: Sure", "[Today]", "Jane: Which place?"])
+        # the whole reply since your last message, for the reply scan
+        self.assertEqual(outreach.their_last_words(dated, jane), "Sure\nWhich place?")
+        self.assertEqual(outreach.their_last_words(dated[:1], jane), "")
+        p = outreach.personalization_prompt("Hi Jane,\n\nDraft.", jane, "g", None, thread=text)
+        self.assertIn("Jane: Thanks Sam!", p)
+        self.assertIn("continues that conversation", p)
+        self.assertIn("never answer for the sender", p)
+        self.assertIn("today is", p)  # so an old plan isn't mistaken for a current one  # no accepting plans or promising in your name
+        g = outreach.grounding_prompt("Hi Jane", jane, None, text)
+        self.assertIn("Jane: Thanks Sam!", g)
+        self.assertIn("confirms a plan", g)
+
+    def test_conversation_waiting_on_you_is_held(self):
+        jane = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
+        base = "Hi Jane,\n\nTry https://x.io when you can, and tell me.\n\nSam"
+        thread = "Jane: Which day works for you next week?"
+        # Claude sees she's waiting on you and says HOLD: nothing is written for her
+        text, note = outreach.personalize(FakeClaude(replies=["HOLD"]), base, jane, "g", thread=thread)
+        self.assertEqual((text, note.startswith(outreach.HELD)), (base, True))
+        # a rewrite that fails its checks twice isn't swapped for the template when you've talked before
+        ai = FakeClaude(replies=["Hi Jane,\n\nTry https://x.io.\n\nSam", "we're meeting Friday"] * 2)
+        text, note = outreach.personalize(ai, base, jane, "g", thread=thread)
+        self.assertTrue(note.startswith(outreach.HELD))
+        self.assertIn("we're meeting Friday", note)
+        # without a conversation, HOLD is just a bad rewrite and the template goes out as before
+        text, note = outreach.personalize(FakeClaude(replies=["HOLD", "HOLD"]), base, jane, "g")
+        self.assertEqual(text, base)
+        self.assertFalse(note.startswith(outreach.HELD))
+
     def test_cheap_checks_catch_what_a_rewrite_must_keep(self):
         base = "Hi Jane,\n\nTry it at demo.example.com or https://cal.com/sam/15 today.\n\nSam"
         jane = {"first_name": "Jane", "last_name": "Doe", "position": "", "company": ""}
@@ -141,7 +194,7 @@ class PromptTest(unittest.TestCase):
         ai = FakeClaude(replies=[good, "she lived in Lisbon", good, "she lived in Lisbon"])
         text, note = outreach.personalize(ai, base, jane, "g")
         self.assertEqual(text, base)
-        self.assertIn("doesn't support: she lived in Lisbon", note)
+        self.assertIn("doesn't support, or commits you: she lived in Lisbon", note)
         self.assertIn("Fix every problem", ai.prompts[2])
 
         # over-long then cut: the old length rule still holds
@@ -221,6 +274,8 @@ class EnrichPersonalizeTest(unittest.TestCase):
         self.assertIn("Early-stage investor", ai.prompts[0])  # the enriched profile reached Claude
         self.assertIn("Get feedback", ai.prompts[0])
         self.assertEqual(self.db.execute("SELECT brief FROM campaigns").fetchone()[0], "Get feedback")
+        self.assertNotIn("Openers already used", ai.prompts[0])  # nothing written yet
+        self.assertIn("- Personal version.", ai.prompts[2])  # the second rewrite sees the first one's opener
 
         # Already personalized: nothing happens without --redo
         ai2 = FakeClaude(reply="again")
@@ -231,7 +286,9 @@ class EnrichPersonalizeTest(unittest.TestCase):
         ai3 = FakeClaude(reply="Hi {first},\n\nAgain.\n\nSam")
         outreach.cmd_personalize(self.db, self.args("personalize", "c", "--redo"), ai=ai3)
         self.assertIn("Hope all is well at", ai3.prompts[0])  # the template text
-        self.assertNotIn("Personal version", ai3.prompts[0])
+        draft, _, earlier = ai3.prompts[0].partition("Openers already used")
+        self.assertNotIn("Personal version", draft)
+        self.assertEqual(earlier.count("Personal version."), 1)  # the other message's opener, not its own
 
         # A failing Claude keeps the existing text
         before = [m["body"] for m in outreach.campaign_messages(self.db, "c", "draft")]

@@ -326,7 +326,7 @@ class App:
         rows = outreach.campaign_messages(self.db(), b.get("campaign") or "", b.get("status") or None)
         return {"messages": [{k: r[k] for k in ("id", "contact_id", "first_name", "last_name", "url",
                                                  "company", "position", "status", "body", "error",
-                                                 "sent_at", "ai_at")} for r in rows]}
+                                                 "sent_at", "ai_at", "thread")} for r in rows]}
 
     def api_update_message(self, b):
         db = self.db()

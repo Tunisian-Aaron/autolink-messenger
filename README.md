@@ -163,6 +163,24 @@ page loads per person, paced), then has Claude rewrite their draft around one
 or two real details from it, keeping the structure, the ask, the links and the
 sign-off, and using only facts from the profile.
 
+Each rewrite also sees the opening lines of the campaign's last few messages, so
+twenty messages in a row don't all start the same way: every person gets a hook
+that fits only them.
+
+When sending with `--personalize`, the tool opens the conversation first and
+reads what you and the person have already said to each other on LinkedIn. The
+rewrite then continues that conversation instead of restarting it: no
+introducing yourself to someone you've talked to, no repeating what they already
+know, and an unanswered message from them gets acknowledged first. It never
+answers for you, though: a rewrite that accepts, declines or confirms a plan or
+promises something in your name fails the pre-send check. When the person is
+waiting on you (they asked you something, or proposed a meeting), or no rewrite
+that fits the conversation passes the checks, the message is held: nothing is
+sent, it's marked `skipped` with the reason, and you answer them yourself. The
+rewrite also sees when each message was sent and today's date, so a dinner
+proposed in March isn't mistaken for a plan this week. The earlier conversation
+is kept with the message, so the Review tab shows it above what was sent.
+
 ```bash
 python outreach.py personalize beta-oct --enrich \
   --brief "Get honest product feedback on Acme from founders, and open the door to a call"
@@ -232,8 +250,12 @@ time with Ctrl-C, and the next run picks up where it left off.
 | What happens | Result |
 |---|---|
 | Login wall, security check, "unusual activity" or restriction notice | Stops the whole run and saves a screenshot |
-| No Message button (not 1st-degree, or messaging off) | That message is marked `failed`; the run continues |
-| Clicked Send but couldn't confirm it went out | Marked `failed`, never retried automatically, so nobody gets it twice |
+| Not a 1st-degree connection | That message is marked `failed`; the run continues |
+| Page didn't load properly, no Message button or message box | Nothing was sent, so that person gets one more try at the end of the run; a second failure is marked `failed` |
+| LinkedIn's "Press Enter to Send" setting is on | Handled: the tool presses Enter instead of clicking Send |
+| Clicked Send but couldn't confirm it went out | Confirmed from the conversation when LinkedIn is just slow; otherwise marked `failed`, never retried automatically, so nobody gets it twice |
+| LinkedIn loads slowly | Page loads are retried; after three timeouts the run stops cleanly |
+| Internet connection drops | Stops; nothing was sent to that person and their message stays a draft |
 | 3 failures in a row | Stops; LinkedIn's layout has probably changed (selectors are at the top of `linkedin_browser.py`) |
 
 Failure screenshots go to `failures/`. Look at failures with
@@ -276,7 +298,9 @@ python outreach.py status
 `replies` opens your inbox in the automation browser, scans the most recent
 conversations (150 by default, `--limit` to change) and marks a message
 *replied* when the latest message in that person's thread is theirs, on or
-after the day you wrote. The web page has a **Check replies** button on the
+after the day you wrote. It then opens each new reply's conversation and saves
+the whole reply, since the inbox only shows one cut-off line (up to 20 per
+scan). The web page has a **Check replies** button on the
 Send tab. `status` shows draft, sent, skipped and replied counts and the reply
 rate for each campaign.
 

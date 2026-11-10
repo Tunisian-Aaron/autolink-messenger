@@ -37,6 +37,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
 
 def load_env_file(path: Path = Path(__file__).resolve().parent / ".env"):
     """Read KEY=VALUE lines from a .env next to this file (gitignored), without overriding
@@ -115,6 +116,8 @@ def connect(path: str) -> sqlite3.Connection:
         db.execute("UPDATE messages SET base_body=body")
     if "reply" not in cols:  # what `replies` saw them answer
         db.execute("ALTER TABLE messages ADD COLUMN reply TEXT")
+    if "thread" not in cols:  # the conversation already there when the message was sent
+        db.execute("ALTER TABLE messages ADD COLUMN thread TEXT")
     if "tags" not in {r[1] for r in db.execute("PRAGMA table_info(contacts)")}:
         db.execute("ALTER TABLE contacts ADD COLUMN tags TEXT")
     return db
@@ -519,13 +522,104 @@ def recipient_facts(contact, profile=None) -> list[str]:
     return facts
 
 
-def personalization_prompt(base: str, contact, brief: str, profile=None) -> str:
+RECENT_OPENERS = 8
+# Notes starting with this mean "don't send; the person is waiting on you in the conversation".
+HELD = "held for you"  # how many earlier messages the rewrite sees, so it doesn't repeat their hooks
+
+
+def opener(body: str) -> str:
+    """The first real line of a message: what comes after the greeting."""
+    lines = [ln.strip() for ln in body.split("\n") if ln.strip()]
+    if len(lines) > 1 and len(lines[0].split()) <= 3:  # "Hi Jane," is the greeting, not the hook
+        lines = lines[1:]
+    hook = ""
+    for sentence in re.split(r"(?<=[.!?:])\s+", lines[0] if lines else ""):
+        hook = f"{hook} {sentence}".strip()
+        if len(hook) > 90:  # the first sentence or two: the hook, not the product description
+            break
+    return hook[:220]
+
+
+def recent_openers(db, campaign_id, exclude_id=None, n: int = RECENT_OPENERS) -> list[str]:
+    """Distinct openers of the campaign's latest rewritten messages, newest first. The message
+    being rewritten is left out, so a redo isn't steered away from its own best hook."""
+    rows = db.execute("SELECT body FROM messages WHERE campaign_id=? AND ai_at IS NOT NULL AND id IS NOT ? "
+                      "ORDER BY COALESCE(sent_at, ai_at) DESC, id DESC LIMIT ?", (campaign_id, exclude_id, n)).fetchall()
+    seen, out = set(), []
+    for o in (opener(r["body"]) for r in rows):
+        if o and o not in seen:
+            seen.add(o)
+            out.append(o)
+    return out
+
+
+THREAD_MESSAGES = 8  # how much of an existing conversation the rewrite sees
+THREAD_CHARS = 400   # per message
+
+
+def thread_text(thread, contact) -> str:
+    """An existing LinkedIn conversation as 'You: ...' / 'Jane: ...' lines, oldest first, with
+    LinkedIn's date heading ("[Oct 6]", "[Today]") on its own line whenever the day changes."""
+    lines, day = [], ""
+    for m in (thread or [])[-THREAD_MESSAGES:]:
+        text = " ".join(m.get("text", "").split())[:THREAD_CHARS]
+        if not text:
+            continue
+        if m.get("day") and m["day"] != day:
+            day = m["day"]
+            lines.append(f"[{day.title()}]")
+        lines.append(f"{contact['first_name'] if is_theirs(m, contact) else 'You'}: {text}")
+    return "\n".join(lines)
+
+
+def is_theirs(m, contact) -> bool:
+    """Whether a message in a conversation was written by the contact (and not by you)."""
+    who = (m.get("who") or "").strip().lower()
+    first = (contact["first_name"] or "").strip().lower()
+    full = f"{contact['first_name']} {contact['last_name']}".strip().lower()
+    return bool(who) and (who == full or who.split()[0] == first)
+
+
+def their_last_words(thread, contact, limit: int = 2000) -> str:
+    """What the contact wrote since your last message: the full reply, not the inbox preview."""
+    run = []
+    for m in reversed(thread or []):
+        if not is_theirs(m, contact):
+            break
+        run.append(m.get("text", "").strip())
+    return "\n".join(t for t in reversed(run) if t)[:limit]
+
+
+def personalization_prompt(base: str, contact, brief: str, profile=None, recent=(), thread: str = "") -> str:
+    earlier = ""
+    if thread:
+        today = dt.date.today()
+        earlier += ("Messages already exchanged with this person on LinkedIn, oldest first (today is "
+                    f"{today:%A, %B} {today.day}, {today.year}; dates in brackets say when they were sent):\n"
+                    + thread + "\n\nThe new message continues that conversation, so its first line after the greeting "
+                    "must pick up from it in a few words (what you last talked about, or what they last did), "
+                    "even when the topic was different. Don't introduce yourself as a stranger or repeat what "
+                    "they already know. If their last message is unanswered, acknowledge it in a few natural "
+                    "words (\"thanks for the invite\"), but never answer for the sender: don't accept, decline "
+                    "or confirm plans, meetings, times, places or offers, don't promise anything, and don't "
+                    "talk about the conversation itself (no \"separate thread\", no \"I'll reply to that "
+                    "separately\"). If this ask was already made, make the message a short, natural follow-up "
+                    "instead.\n\nOne exception: if their last message is waiting on the sender personally (a "
+                    "question, or a meeting or plan they proposed, from someone the sender knows), a pitch "
+                    "would ignore them, so reply with exactly HOLD and nothing else. A sales pitch or an "
+                    "event invite isn't waiting on the sender, and neither is anything from more than about "
+                    "three weeks ago: old plans, invitations and events are over, so never treat them as "
+                    "current.\n\n")
+    if recent:
+        earlier += ("Openers already used for other people in this campaign. Don't reuse their angle, "
+                    "wording or sentence shape; this person's opening line should fit only them:\n- "
+                    + "\n- ".join(recent) + "\n\n")
     return (
         "You help someone send a short LinkedIn message to one of their existing connections.\n\n"
         f"Campaign goal:\n{brief}\n\n"
         "Recipient, from their LinkedIn profile. This is everything known about them:\n"
         + "\n".join(recipient_facts(contact, profile)) + "\n\n"
-        f"Draft message:\n{base}\n\n"
+        f"Draft message:\n{base}\n\n" + earlier +
         "Rewrite the draft so it reads as written for this person:\n"
         "- Keep the draft's structure, voice, core ask, links and sign-off.\n"
         f"- Keep the length: the draft is {len(base.split())} words, and the result must not be longer. "
@@ -581,43 +675,52 @@ def rewrite_problems(base: str, text: str, contact=None) -> list[str]:
     return problems
 
 
-def grounding_prompt(text: str, contact, profile=None) -> str:
+def grounding_prompt(text: str, contact, profile=None, thread: str = "") -> str:
+    known = "\n".join(recipient_facts(contact, profile))
+    if thread:
+        known += f"\n\nMessages already exchanged with them (also known facts):\n{thread}"
     return ("A message is about to be sent to a LinkedIn connection. Below is everything the sender knows "
             "about the recipient, then the message.\n\nKnown facts:\n"
-            + "\n".join(recipient_facts(contact, profile)) + f"\n\nMessage:\n{text}\n\n"
+            + known + f"\n\nMessage:\n{text}\n\n"
             "List every statement the message makes about the recipient (their work, past, places, studies, "
             "achievements, opinions, or their relationship with the sender) that the known facts do not "
             "support. A fair paraphrase of a fact is supported. Ignore what the message says about the sender, "
-            "their product and the ask. Reply with exactly NONE if every statement is supported; otherwise "
-            "one unsupported statement per line, nothing else.")
+            "their product and the ask, except commitments: also list any line where the message accepts, "
+            "declines or confirms a plan, meeting, time, place or offer, or promises something on the "
+            "sender's behalf. Reply with exactly NONE if there is nothing to list; otherwise one statement "
+            "per line, nothing else.")
 
 
-def unsupported_claims(ai, text: str, contact, profile=None) -> list[str]:
-    reply = (ai.generate(grounding_prompt(text, contact, profile)) or "").strip()
+def unsupported_claims(ai, text: str, contact, profile=None, thread: str = "") -> list[str]:
+    reply = (ai.generate(grounding_prompt(text, contact, profile, thread)) or "").strip()
     if not reply or reply.upper().startswith("NONE"):
         return []
     return [ln.strip("-*\u2022 ").strip() for ln in reply.splitlines() if ln.strip()][:5]
 
 
-def check_rewrite(ai, base: str, text: str, contact, profile=None) -> list[str]:
+def check_rewrite(ai, base: str, text: str, contact, profile=None, thread: str = "") -> list[str]:
     problems = rewrite_problems(base, text, contact)
     if not problems:  # the grounding check costs a call, so only when the free checks pass
-        problems = [f"it says something the profile doesn't support: {c}"
-                    for c in unsupported_claims(ai, text, contact, profile)]
+        problems = [f"it says something the profile doesn't support, or commits you: {c}"
+                    for c in unsupported_claims(ai, text, contact, profile, thread)]
     return problems
 
 
-def personalize(ai, base: str, contact, brief: str, profile=None) -> tuple[str, str]:
-    """Have Claude tailor the rendered draft and check the result.
+def personalize(ai, base: str, contact, brief: str, profile=None, recent=(), thread: str = "") -> tuple[str, str]:
+    """Have Claude tailor the rendered draft and check the result. `recent` holds openers of
+    messages already written in this campaign, so each new one finds its own angle; `thread`
+    is the conversation already had with this person, so the message continues it.
 
     Returns (text, note): note is empty when the rewrite passed, otherwise why the
     template text is being used instead.
     """
-    prompt = personalization_prompt(base, contact, brief, profile)
+    prompt = personalization_prompt(base, contact, brief, profile, recent, thread)
     text = (ai.generate(prompt) or "").strip()
+    if thread and text.upper().rstrip(".") == "HOLD":
+        return base, f"{HELD}: they're waiting on your reply in your LinkedIn conversation"
     if not text:
         return base, "Claude declined; using the template text"
-    problems = check_rewrite(ai, base, text, contact, profile)
+    problems = check_rewrite(ai, base, text, contact, profile, thread)
     if not problems:
         return text, ""
     retry = (ai.generate(
@@ -625,9 +728,11 @@ def personalize(ai, base: str, contact, brief: str, profile=None) -> tuple[str, 
         + "\n\nFix every problem. Keep the single best personal detail and the ask; everything the draft "
         f"had that must not change stays exactly as it was.\n\n{text}") or "").strip()
     if retry:
-        problems = check_rewrite(ai, base, retry, contact, profile)
+        problems = check_rewrite(ai, base, retry, contact, profile, thread)
         if not problems:
             return retry, ""
+    if thread:  # the template ignores what you've already said to each other, so don't send it
+        return base, f"{HELD}: no rewrite that fits your conversation passed the checks (" + "; ".join(problems) + ")"
     return base, "using the template text; the rewrite " + "; ".join(problems)
 
 
@@ -686,7 +791,7 @@ def cmd_draft(db, args):
         if client is not None:
             try:
                 profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (c["id"],)).fetchone()
-                body, note = personalize(client, body, c, brief, profile)
+                body, note = personalize(client, body, c, brief, profile, recent_openers(db, camp["id"] if camp else None))
                 if note:
                     print(f"  ! #{c['id']}: {note}")
             except Exception as e:  # keep the template draft rather than abort the batch
@@ -775,21 +880,31 @@ def cmd_enrich(db, args, page_factory=None, should_stop=lambda: False, sleep=tim
     return done
 
 
-def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep) -> str:
-    """Rewrite one waiting message from the person's profile and save it. With a `page`, the
-    profile is read first when it isn't in the database yet. Returns (body, note): the note says
-    why the template text was kept, or is empty."""
+def ensure_profile(db, m, page, sleep=time.sleep):
+    """Read this person's profile into the database if it isn't there yet."""
     import linkedin_browser as lb
-    profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
-    if profile is None and page is not None and m["url"]:
+    if m["url"] and not db.execute("SELECT 1 FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone():
         p = lb.read_profile(page, m["url"], sleep=sleep)
         db.execute("INSERT OR REPLACE INTO profiles (contact_id, headline, location, about, experience, "
                    "education, fetched_at) VALUES (?,?,?,?,?,?,?)",
                    (m["contact_id"], p["headline"], p["location"], p["about"], p["experience"], p["education"], now()))
         db.commit()
-        profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
-    body, note = personalize(ai, m["base_body"] or m["body"], m, brief, profile)
-    db.execute("UPDATE messages SET body=?, ai_at=?, updated_at=? WHERE id=?", (body, now(), now(), m["id"]))
+
+
+def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep, thread=None) -> tuple[str, str]:
+    """Rewrite one waiting message from the person's profile and save it. With a `page`, the
+    profile is read first when it isn't in the database yet. The rewrite sees the openers of the
+    campaign's latest messages so it doesn't repeat them, and `thread` (the conversation already
+    open with this person, from LinkedInSender.open) so it continues rather than restarts it.
+    Returns (body, note): the note says why the template text was kept, or is empty."""
+    if page is not None:
+        ensure_profile(db, m, page, sleep)
+    profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
+    history = thread_text(thread, m) if thread else ""
+    body, note = personalize(ai, m["base_body"] or m["body"], m, brief, profile,
+                             recent_openers(db, m["campaign_id"], m["id"]), history)
+    db.execute("UPDATE messages SET body=?, ai_at=?, thread=COALESCE(?, thread), updated_at=? WHERE id=?",
+               (body, now(), history or None, now(), m["id"]))
     db.commit()
     return body, note
 
@@ -887,38 +1002,73 @@ def parse_inbox_when(label: str, today: dt.date | None = None) -> dt.date | None
     return None
 
 
+FULL_REPLIES = 20  # conversations opened per scan to read a reply in full
+
+
+def site(url: str) -> str:
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def plain_name(name: str) -> str:
+    """Lower-case name without the credentials LinkedIn appends ("Jane Doe, PhD" -> "jane doe")."""
+    return name.split(",")[0].strip().lower()
+
+
 def cmd_replies(db, args, page_factory=None, inbox=None):
     """Scan the inbox; anyone we messaged whose latest message in the thread is theirs,
     on or after the day we wrote, is marked replied."""
     import linkedin_browser as lb
-    waiting = db.execute("SELECT m.*, c.first_name, c.last_name FROM messages m JOIN contacts c ON c.id=m.contact_id "
-                         "WHERE m.status='sent'").fetchall()
+    waiting = db.execute("SELECT m.*, c.first_name, c.last_name, c.url FROM messages m "
+                         "JOIN contacts c ON c.id=m.contact_id WHERE m.status='sent'").fetchall()
     if not waiting:
         print("No sent messages waiting for a reply.")
         return 0
-    if inbox is None:
+    def record(inbox, full_reply=lambda m: ""):
+        by_name = {}
+        for conv in inbox:
+            by_name.setdefault(plain_name(conv["name"]), conv)
+        found = 0
+        for m in waiting:
+            conv = by_name.get(plain_name(f"{m['first_name']} {m['last_name']}"))
+            if not conv or conv["from_me"]:
+                continue
+            when = parse_inbox_when(conv["when"])
+            if when and m["sent_at"] and when < dt.date.fromisoformat(m["sent_at"][:10]):
+                continue  # an older conversation, before our message
+            reply = full_reply(m) or conv["preview"][:500]
+            db.execute("UPDATE messages SET status='replied', reply=?, updated_at=? WHERE id=?",
+                       (reply, now(), m["id"]))
+            db.commit()
+            found += 1
+            print(f"  replied: {m['first_name']} {m['last_name']}: {' '.join(reply.split())[:80]}")
+        return found
+
+    if inbox is not None:
+        found = record(inbox)
+    else:
         if page_factory is None:
             def page_factory():
                 return lb.browser(args.profile_dir, headless=args.headless, channel=args.channel)
         with page_factory() as page:
-            lb.ensure_logged_in(page, args.url or lb.MESSAGING_URL)
-            inbox = lb.read_inbox(page, args.url or lb.MESSAGING_URL, limit=args.limit)
-    by_name = {}
-    for conv in inbox:
-        by_name.setdefault(conv["name"].strip().lower(), conv)
-    found = 0
-    for m in waiting:
-        conv = by_name.get(f"{m['first_name']} {m['last_name']}".strip().lower())
-        if not conv or conv["from_me"]:
-            continue
-        when = parse_inbox_when(conv["when"])
-        if when and m["sent_at"] and when < dt.date.fromisoformat(m["sent_at"][:10]):
-            continue  # an older conversation, before our message
-        db.execute("UPDATE messages SET status='replied', reply=?, updated_at=? WHERE id=?",
-                   (conv["preview"][:500], now(), m["id"]))
-        found += 1
-        print(f"  replied: {m['first_name']} {m['last_name']}: {conv['preview'][:80]}")
-    db.commit()
+            inbox_url = args.url or lb.MESSAGING_URL
+            lb.ensure_logged_in(page, inbox_url)
+            inbox = lb.read_inbox(page, inbox_url, limit=args.limit)
+            sender, opened = lb.LinkedInSender(page), []
+
+            def full_reply(m):
+                # The inbox shows one cut-off line, so open the conversation for the whole reply.
+                # Only on the inbox's own site (tests against a local mock never touch LinkedIn).
+                if len(opened) >= FULL_REPLIES or not m["url"] or site(m["url"]) != site(inbox_url):
+                    return ""
+                opened.append(m["id"])
+                try:
+                    page.wait_for_timeout(random.uniform(2000, 5000) if len(opened) > 1 else 0)
+                    return their_last_words(sender.open(m["url"]), m)
+                except lb.StopRun:
+                    raise
+                except Exception:
+                    return ""
+            found = record(inbox, full_reply)
     print(f"Checked {len(inbox)} conversation(s): {found} new repl{'y' if found == 1 else 'ies'}, "
           f"{len(waiting) - found} still waiting.")
     return found
@@ -937,6 +1087,12 @@ def campaign_messages(db, name, status=None):
         sql += " AND m.status=?"
         params.append(status)
     return db.execute(sql + " ORDER BY m.id", params).fetchall()
+
+
+def message_row(db, message_id):
+    """One message as campaign_messages returns it, read fresh from the database."""
+    return db.execute("SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position FROM messages m "
+                      "JOIN contacts c ON c.id=m.contact_id WHERE m.id=?", (message_id,)).fetchone()
 
 
 def cmd_review(db, args):
@@ -999,8 +1155,9 @@ def cmd_mark(db, args):
     ids = [int(x) for x in args.contact_ids.split(",")]
     for cid in ids:
         db.execute("UPDATE messages SET status=?, updated_at=?, sent_at=COALESCE(sent_at, CASE WHEN ? IN "
-                   "('sent','replied') THEN ? END) WHERE campaign_id=? AND contact_id=?",
-                   (args.status, now(), args.status, now(), camp["id"], cid))
+                   "('sent','replied') THEN ? END), error=CASE WHEN ?='draft' THEN NULL ELSE error END "
+                   "WHERE campaign_id=? AND contact_id=?",
+                   (args.status, now(), args.status, now(), args.status, camp["id"], cid))
     db.commit()
     print(f"Marked {len(ids)} message(s) as {args.status}.")
 
@@ -1008,6 +1165,16 @@ def cmd_mark(db, args):
 # --------------------------------------------------------------------------
 # Assisted sending
 # --------------------------------------------------------------------------
+
+NETWORK_ERRORS = ("ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_",
+                  "ERR_NETWORK_CHANGED", "ERR_ADDRESS_UNREACHABLE", "ERR_PROXY_CONNECTION_FAILED")
+
+
+def network_error(e: BaseException) -> bool:
+    """True for the browser's no-network errors (net::ERR_INTERNET_DISCONNECTED and friends)."""
+    text = str(e)
+    return "net::" in text and any(code in text for code in NETWORK_ERRORS)
+
 
 def sent_last_24h(db) -> int:
     cutoff = (dt.datetime.now() - dt.timedelta(hours=24)).isoformat(timespec="seconds")
@@ -1136,7 +1303,8 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
         def sender_factory():
             return lb.browser(args.profile_dir, headless=args.headless, channel=args.channel)
 
-    sent = failed = consecutive = 0
+    sent = held = consecutive = 0
+    failed_ids, retried = [], set()
     shots = Path(args.screenshots)
     stop = stop_flag()  # webapp.py's Stop button sends SIGTERM; a stop lands between messages
 
@@ -1153,7 +1321,8 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
         first_url = next((m["url"] for m in batch if m["url"]), None)
         if first_url:  # logged out? wait for you to log in before touching the queue
             lb.ensure_logged_in(page, lb.feed_url_for(first_url), cancelled=stopping)
-        for i, m in enumerate(batch):
+        todo = list(batch)  # grows: a send that fails before anything went out gets one more try at the end
+        for i, m in enumerate(todo):
             if i:
                 delay = random.uniform(args.min_delay, args.max_delay)
                 print(f"  waiting {delay:.0f}s...")
@@ -1161,32 +1330,66 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
             if stopping():
                 print("Stopped.")
                 break
+            if m["id"] in retried:
+                m = message_row(db, m["id"])  # it may have been personalized on the first try
             who = f"{m['first_name']} {m['last_name']}"
             body = m["body"]
-            if ai is not None and not m["ai_at"]:
-                try:  # read their profile and rewrite the draft now, just before it goes out
-                    body, note = personalize_message(db, ai, m, brief, page=page, sleep=sleep)
-                    print(f"  ! {who}: {note}" if note else f"  personalized {who}")
+            rewrite = ai is not None and not m["ai_at"]
+            if rewrite:
+                try:  # their profile first: reading it leaves the page, so before the conversation opens
+                    ensure_profile(db, m, page, sleep)
                 except lb.StopRun:
                     raise
                 except Exception as e:
-                    print(f"  ! {who}: couldn't personalize ({type(e).__name__}: {e}); sending the template text")
+                    print(f"  ! {who}: couldn't read the profile ({type(e).__name__}: {e})")
             try:
-                sender.send(m["url"], body, dry_run=args.dry_run)
+                thread = sender.open(m["url"])
+                if thread:
+                    print(f"  {len(thread)} earlier message(s) in the conversation with {who}")
+                    if not rewrite and not args.dry_run:
+                        db.execute("UPDATE messages SET thread=? WHERE id=?", (thread_text(thread, m), m["id"]))
+                        db.commit()
+                if rewrite:
+                    try:  # rewrite the draft now, knowing their profile and what was already said
+                        body, note = personalize_message(db, ai, m, brief, thread=thread)
+                        if note.startswith(HELD):
+                            print(f"  - {who}: {note}; not sent, marked skipped")
+                            held += 1
+                            if not args.dry_run:
+                                db.execute("UPDATE messages SET status='skipped', error=?, updated_at=? "
+                                           "WHERE id=?", (note, now(), m["id"]))
+                                db.commit()
+                            continue
+                        print(f"  ! {who}: {note}" if note else f"  personalized {who}")
+                    except Exception as e:
+                        print(f"  ! {who}: couldn't personalize ({type(e).__name__}: {e}); sending the template text")
+                sender.send_text(body, dry_run=args.dry_run)
             except lb.StopRun as e:
                 print(f"STOPPED: {e}")
                 sender.screenshot(str(shots / f"stopped-{m['contact_id']}.png"))
                 break
             except Exception as e:  # one bad profile shouldn't kill the run
-                failed += 1
+                if network_error(e):
+                    print(f"  x {who}: {str(e).splitlines()[0]}")
+                    print("STOPPED: no internet connection. Nothing was sent to them and their message stays "
+                          "a draft; reconnect and run again.")
+                    break
                 consecutive += 1
                 msg = f"{type(e).__name__}: {e}"
-                print(f"  x {who}: {msg}")
                 sender.screenshot(str(shots / f"failed-{m['contact_id']}.png"))
-                if not args.dry_run:
-                    db.execute("UPDATE messages SET status='failed', error=?, updated_at=? WHERE id=?",
-                               (msg, now(), m["id"]))
-                    db.commit()
+                # A slow or half-loaded page fails before anything is sent, so it's safe to try once
+                # more later. Not when the person can't be messaged, or Send was already pressed.
+                if not isinstance(e, (lb.NotReachable, lb.Unconfirmed)) and m["id"] not in retried:
+                    retried.add(m["id"])
+                    todo.append(m)
+                    print(f"  ~ {who}: {msg.splitlines()[0]}; will try once more at the end of the run")
+                else:
+                    failed_ids.append(m["contact_id"])
+                    print(f"  x {who}: {msg}")
+                    if not args.dry_run:
+                        db.execute("UPDATE messages SET status='failed', error=?, updated_at=? WHERE id=?",
+                                   (msg, now(), m["id"]))
+                        db.commit()
                 if consecutive >= 3:
                     print("STOPPED: 3 failures in a row - LinkedIn's page layout may have changed. "
                           f"See screenshots in {shots}/.")
@@ -1202,11 +1405,14 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                 db.commit()
                 print(f"  sent {who}")
     verb = "checked" if args.dry_run else "sent"
-    print(f"\nDone: {sent} {verb}, {failed} failed. "
+    print(f"\nDone: {sent} {verb}, {len(failed_ids)} failed{f', {held} held for you' if held else ''}. "
           f"{len(campaign_messages(db, args.campaign, 'draft'))} draft(s) remaining.")
-    if failed and not args.dry_run:
+    if failed_ids and not args.dry_run:
         print(f"Failed messages are marked 'failed' (see `review {args.campaign} --status failed`); "
-              f"requeue with `mark {args.campaign} <ids> draft`.")
+              f"requeue with `mark {args.campaign} {','.join(map(str, failed_ids))} draft`.")
+    if held and not args.dry_run:
+        print(f"Held messages are marked 'skipped' (see `review {args.campaign} --status skipped`): "
+              "answer those people yourself first.")
 
 
 # --------------------------------------------------------------------------
