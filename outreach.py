@@ -59,6 +59,9 @@ load_env_file()
 DEFAULT_DB = os.environ.get("OUTREACH_DB", "outreach.db")
 DEFAULT_DAILY_CAP = 25
 LINKEDIN_MAX_CHARS = 8000
+NOTE_CHARS = 200          # a connection request's note on a free account (LinkedIn's box says the real limit)
+NOTE_CHARS_PREMIUM = 300
+DEFAULT_INVITE_CAP = 15   # connection requests per rolling 24h; LinkedIn allows roughly 100 a week
 AI_MODEL = "claude-opus-5-5"
 
 SCHEMA = """
@@ -68,7 +71,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     first_name TEXT, last_name TEXT, url TEXT, email TEXT,
     company TEXT, position TEXT, connected_on TEXT,
     do_not_contact INTEGER NOT NULL DEFAULT 0,
-    tags TEXT  -- ",founder,travel," as set by `tag`; NULL until the person has been sorted
+    tags TEXT,  -- ",founder,travel," as set by `tag`; NULL until the person has been sorted
+    prospect INTEGER NOT NULL DEFAULT 0  -- 1: not a connection yet; 2: invited without a note, awaiting their answer
 );
 CREATE TABLE IF NOT EXISTS campaigns (
     id INTEGER PRIMARY KEY,
@@ -118,8 +122,15 @@ def connect(path: str) -> sqlite3.Connection:
         db.execute("ALTER TABLE messages ADD COLUMN reply TEXT")
     if "thread" not in cols:  # the conversation already there when the message was sent
         db.execute("ALTER TABLE messages ADD COLUMN thread TEXT")
-    if "tags" not in {r[1] for r in db.execute("PRAGMA table_info(contacts)")}:
+    if "kind" not in cols:  # 'invite' when it went out as the note on a connection request
+        db.execute("ALTER TABLE messages ADD COLUMN kind TEXT")
+    if "invited_at" not in cols:  # when a connection request went to this person, with or without a note
+        db.execute("ALTER TABLE messages ADD COLUMN invited_at TEXT")
+    contact_cols = {r[1] for r in db.execute("PRAGMA table_info(contacts)")}
+    if "tags" not in contact_cols:
         db.execute("ALTER TABLE contacts ADD COLUMN tags TEXT")
+    if "prospect" not in contact_cols:
+        db.execute("ALTER TABLE contacts ADD COLUMN prospect INTEGER NOT NULL DEFAULT 0")
     return db
 
 
@@ -173,21 +184,26 @@ def read_connections_csv(path: str) -> list[dict]:
 CONTACT_FIELDS = ("first_name", "last_name", "url", "email", "company", "position", "connected_on")
 
 
-def save_contacts(db, rows, fill_blanks_only=False) -> tuple[int, int]:
+def save_contacts(db, rows, fill_blanks_only=False, prospect=False) -> tuple[int, int]:
     """Insert or update contacts by profile URL. fill_blanks_only keeps existing values
-    (used for the scraped list, which is less complete than LinkedIn's CSV export)."""
-    if fill_blanks_only:
+    (used for the scraped list, which is less complete than LinkedIn's CSV export).
+
+    prospect=True adds people you aren't connected to yet; someone already known keeps their
+    standing. Importing connections clears it, so an accepted invitation becomes a connection."""
+    if fill_blanks_only or prospect:
         sets = ", ".join(f"{c}=COALESCE(NULLIF({c}, ''), excluded.{c})" for c in CONTACT_FIELDS)
     else:
         sets = ", ".join(f"{c}=excluded.{c}" for c in CONTACT_FIELDS)
+    if not prospect:
+        sets += ", prospect=0"
     added = updated = 0
     for r in rows:
         key = r["url"].rstrip("/").lower() or f"name:{r['first_name']} {r['last_name']}".lower()
         exists = db.execute("SELECT 1 FROM contacts WHERE key=?", (key,)).fetchone()
         db.execute(
-            f"""INSERT INTO contacts (key, {", ".join(CONTACT_FIELDS)}) VALUES (?,?,?,?,?,?,?,?)
+            f"""INSERT INTO contacts (key, {", ".join(CONTACT_FIELDS)}, prospect) VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET {sets}""",
-            (key, *(r[c] for c in CONTACT_FIELDS)),
+            (key, *(r[c] for c in CONTACT_FIELDS), int(prospect)),
         )
         updated += bool(exists)
         added += not exists
@@ -199,6 +215,78 @@ def cmd_import(db, args):
     rows = read_connections_csv(args.csv)
     added, updated = save_contacts(db, rows)
     print(f"Imported {len(rows)} connections ({added} new, {updated} updated).")
+
+
+PROFILE_URL = re.compile(r"(?:(https?)://)?([a-z0-9.:-]+)/in/([^\s,;?#/]+)[^\s,;]*", re.I)
+
+
+def parse_prospects(text: str) -> list[dict]:
+    """People to connect with, one per line: a LinkedIn profile link, optionally with their
+    name, company and title on the same line, separated by commas or tabs."""
+    rows = {}
+    for line in text.splitlines():
+        m = PROFILE_URL.search(line)
+        if not m:
+            continue
+        scheme, host, slug = m.groups()
+        # every spelling of a LinkedIn link (no scheme, country subdomain, tracking query) is one person
+        url = (f"https://www.linkedin.com/in/{slug}" if host.lower().endswith("linkedin.com")
+               else f"{scheme or 'https'}://{host}/in/{slug}")
+        rest = [x.strip() for x in re.split(r"[,;\t]", line[:m.start()] + "," + line[m.end():]) if x.strip()]
+        first, _, last = (rest[0] if rest else "").partition(" ")
+        rows.setdefault(url.lower(), {
+            "first_name": first, "last_name": last.strip(), "url": url, "email": "",
+            "company": rest[1] if len(rest) > 1 else "", "position": rest[2] if len(rest) > 2 else "",
+            "connected_on": None})
+    return list(rows.values())
+
+
+def cmd_add_prospects(db, args, page_factory=None, sleep=time.sleep):
+    """Add people you aren't connected to yet. A campaign drafted for them (`draft --prospects`)
+    goes out as connection requests, each message as the note."""
+    import linkedin_browser as lb
+    text = "\n".join(args.urls or [])
+    if getattr(args, "file", None):
+        text += "\n" + Path(args.file).read_text(encoding="utf-8-sig")
+    rows = parse_prospects(text)
+    if not rows:
+        raise SystemExit("No LinkedIn profile links found (they look like https://www.linkedin.com/in/someone).")
+    known = {r["key"]: r for r in db.execute("SELECT key, prospect FROM contacts")}
+    new = [r for r in rows if r["url"].lower() not in known]
+    connected = [r for r in rows if r["url"].lower() in known and not known[r["url"].lower()]["prospect"]]
+    nameless = [r for r in new if not r["first_name"]]
+    if nameless:  # only a link: read their name and headline from the profile
+        if page_factory is None:
+            def page_factory():
+                return lb.browser(args.profile_dir, headless=args.headless, channel=args.channel)
+        with page_factory() as page:
+            lb.ensure_logged_in(page, lb.feed_url_for(nameless[0]["url"]))
+            for i, r in enumerate(nameless):
+                if i:
+                    sleep(random.uniform(2, 4))
+                try:
+                    card = lb.read_card(page, r["url"])
+                except lb.StopRun as e:
+                    print(f"STOPPED: {e}")
+                    break
+                except Exception as e:
+                    print(f"  ! {r['url']}: couldn't read the profile ({type(e).__name__})")
+                    continue
+                first, _, last = card["name"].partition(" ")
+                r.update(first_name=first, last_name=last.strip(), position=r["position"] or card["headline"])
+                if "1st" in card["degree"]:
+                    new.remove(r)
+                    connected.append(r)
+                    save_contacts(db, [r], fill_blanks_only=True)
+                print(f"  {card['name']} ({card['degree'].strip('· ') or 'degree unknown'})")
+    ready = [r for r in new if r["first_name"]]
+    added, _ = save_contacts(db, ready, prospect=True)
+    print(f"Added {added} {'person' if added == 1 else 'people'} to reach with a connection request"
+          + (f"; {len(connected)} already connected to you" if connected else "")
+          + (f"; {len(rows) - len(new) - len(connected)} already on the list" if len(rows) - len(new) - len(connected) else "")
+          + (f"; {len(new) - len(ready)} skipped (no name found)" if len(new) - len(ready) else "") + ".")
+    if added:
+        print("Next: draft --prospects <campaign> --template <a short note>, then autosend.")
 
 
 def cmd_import_linkedin(db, args, page_factory=None, should_stop=lambda: False, sleep=time.sleep):
@@ -250,10 +338,13 @@ def add_filter_args(p):
     g.add_argument("--before", help="connected before YYYY-MM-DD")
     g.add_argument("--ids", help="comma-separated contact ids")
     g.add_argument("--limit", type=int)
+    g.add_argument("--prospects", action="store_true",
+                   help="people you aren't connected to yet (see add-prospects) instead of your connections")
 
 
 def select_contacts(db, args, extra_where: str = "", extra_params=()):
-    where, params = ["do_not_contact = 0"], []
+    # Connections and not-yet-connections never mix: one gets a message, the other a short note.
+    where, params = ["do_not_contact = 0", "prospect = ?"], [int(bool(getattr(args, "prospects", False)))]
 
     def any_like(col, values, negate=False):
         if not values:
@@ -590,7 +681,9 @@ def their_last_words(thread, contact, limit: int = 2000) -> str:
     return "\n".join(t for t in reversed(run) if t)[:limit]
 
 
-def personalization_prompt(base: str, contact, brief: str, profile=None, recent=(), thread: str = "") -> str:
+def personalization_prompt(base: str, contact, brief: str, profile=None, recent=(), thread: str = "",
+                           max_chars: int = 0) -> str:
+    """`max_chars` is set for the note on a connection request, which LinkedIn caps in characters."""
     earlier = ""
     if thread:
         today = dt.date.today()
@@ -615,15 +708,20 @@ def personalization_prompt(base: str, contact, brief: str, profile=None, recent=
                     "wording or sentence shape; this person's opening line should fit only them:\n- "
                     + "\n- ".join(recent) + "\n\n")
     return (
-        "You help someone send a short LinkedIn message to one of their existing connections.\n\n"
+        ("You help someone write the note on a LinkedIn connection request to a person they are not "
+         "connected to yet.\n\n" if max_chars else
+         "You help someone send a short LinkedIn message to one of their existing connections.\n\n") +
         f"Campaign goal:\n{brief}\n\n"
         "Recipient, from their LinkedIn profile. This is everything known about them:\n"
         + "\n".join(recipient_facts(contact, profile)) + "\n\n"
         f"Draft message:\n{base}\n\n" + earlier +
         "Rewrite the draft so it reads as written for this person:\n"
         "- Keep the draft's structure, voice, core ask, links and sign-off.\n"
-        f"- Keep the length: the draft is {len(base.split())} words, and the result must not be longer. "
-        "If you add a personal sentence, cut or shorten another one.\n"
+        + (f"- At most {max_chars} characters, spaces and line breaks included: LinkedIn's note box takes "
+           f"no more. The draft is {len(base)}. Aim for {int(max_chars * 0.9)} or fewer; cut words to make "
+           "room for the personal detail.\n" if max_chars else
+           f"- Keep the length: the draft is {len(base.split())} words, and the result must not be longer. "
+           "If you add a personal sentence, cut or shorten another one.\n") +
         "- Change only what makes it personal: open on something specific from their experience, "
         "about text or education, and tie the ask to it where that is natural. One or two concrete "
         "details beat a list.\n"
@@ -649,11 +747,14 @@ URL_RE = re.compile(r"https?://[^\s<>\"')\]]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|
 PREAMBLE_RE = re.compile(r"(?i)^(here('s| is)\b|sure\b|subject:|\"|\u201c|```)")
 
 
-def rewrite_problems(base: str, text: str, contact=None) -> list[str]:
+def rewrite_problems(base: str, text: str, contact=None, max_chars: int = 0) -> list[str]:
     """What a rewrite changed that it must not have. Empty list means it passed."""
     problems = []
     limit = int(len(base.split()) * MAX_GROWTH)
-    if len(text.split()) > limit:
+    if max_chars:
+        if len(text) > max_chars:
+            problems.append(f"it is {len(text)} characters; LinkedIn's note box takes {max_chars}")
+    elif len(text.split()) > limit:
         problems.append(f"it is {len(text.split())} words; the limit is {limit}")
     for url in dict.fromkeys(u.rstrip(".,") for u in URL_RE.findall(base)):
         if url not in text:
@@ -698,15 +799,16 @@ def unsupported_claims(ai, text: str, contact, profile=None, thread: str = "") -
     return [ln.strip("-*\u2022 ").strip() for ln in reply.splitlines() if ln.strip()][:5]
 
 
-def check_rewrite(ai, base: str, text: str, contact, profile=None, thread: str = "") -> list[str]:
-    problems = rewrite_problems(base, text, contact)
+def check_rewrite(ai, base: str, text: str, contact, profile=None, thread: str = "", max_chars: int = 0) -> list[str]:
+    problems = rewrite_problems(base, text, contact, max_chars)
     if not problems:  # the grounding check costs a call, so only when the free checks pass
         problems = [f"it says something the profile doesn't support, or commits you: {c}"
                     for c in unsupported_claims(ai, text, contact, profile, thread)]
     return problems
 
 
-def personalize(ai, base: str, contact, brief: str, profile=None, recent=(), thread: str = "") -> tuple[str, str]:
+def personalize(ai, base: str, contact, brief: str, profile=None, recent=(), thread: str = "",
+                max_chars: int = 0) -> tuple[str, str]:
     """Have Claude tailor the rendered draft and check the result. `recent` holds openers of
     messages already written in this campaign, so each new one finds its own angle; `thread`
     is the conversation already had with this person, so the message continues it.
@@ -714,13 +816,13 @@ def personalize(ai, base: str, contact, brief: str, profile=None, recent=(), thr
     Returns (text, note): note is empty when the rewrite passed, otherwise why the
     template text is being used instead.
     """
-    prompt = personalization_prompt(base, contact, brief, profile, recent, thread)
+    prompt = personalization_prompt(base, contact, brief, profile, recent, thread, max_chars)
     text = (ai.generate(prompt) or "").strip()
     if thread and text.upper().rstrip(".") == "HOLD":
         return base, f"{HELD}: they're waiting on your reply in your LinkedIn conversation"
     if not text:
         return base, "Claude declined; using the template text"
-    problems = check_rewrite(ai, base, text, contact, profile, thread)
+    problems = check_rewrite(ai, base, text, contact, profile, thread, max_chars)
     if not problems:
         return text, ""
     retry = (ai.generate(
@@ -728,7 +830,7 @@ def personalize(ai, base: str, contact, brief: str, profile=None, recent=(), thr
         + "\n\nFix every problem. Keep the single best personal detail and the ask; everything the draft "
         f"had that must not change stays exactly as it was.\n\n{text}") or "").strip()
     if retry:
-        problems = check_rewrite(ai, base, retry, contact, profile, thread)
+        problems = check_rewrite(ai, base, retry, contact, profile, thread, max_chars)
         if not problems:
             return retry, ""
     if thread:  # the template ignores what you've already said to each other, so don't send it
@@ -791,12 +893,16 @@ def cmd_draft(db, args):
         if client is not None:
             try:
                 profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (c["id"],)).fetchone()
-                body, note = personalize(client, body, c, brief, profile, recent_openers(db, camp["id"] if camp else None))
+                body, note = personalize(client, body, c, brief, profile, recent_openers(db, camp["id"] if camp else None),
+                                         max_chars=NOTE_CHARS if c["prospect"] else 0)
                 if note:
                     print(f"  ! #{c['id']}: {note}")
             except Exception as e:  # keep the template draft rather than abort the batch
                 print(f"  ! AI personalization failed for #{c['id']} ({type(e).__name__}: {e}); using template.")
-        if len(body) > LINKEDIN_MAX_CHARS:
+        if c["prospect"] and len(body) > NOTE_CHARS:
+            print(f"  ! #{c['id']}: the note is {len(body)} characters; a connection request takes {NOTE_CHARS} "
+                  f"({NOTE_CHARS_PREMIUM} with Premium).")
+        elif len(body) > LINKEDIN_MAX_CHARS:
             print(f"  ! #{c['id']}: message is {len(body)} chars (LinkedIn limit {LINKEDIN_MAX_CHARS}).")
         if args.dry_run:
             if shown < 3:
@@ -891,7 +997,8 @@ def ensure_profile(db, m, page, sleep=time.sleep):
         db.commit()
 
 
-def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep, thread=None) -> tuple[str, str]:
+def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep, thread=None,
+                        max_chars: int | None = None) -> tuple[str, str]:
     """Rewrite one waiting message from the person's profile and save it. With a `page`, the
     profile is read first when it isn't in the database yet. The rewrite sees the openers of the
     campaign's latest messages so it doesn't repeat them, and `thread` (the conversation already
@@ -901,8 +1008,10 @@ def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep, thre
         ensure_profile(db, m, page, sleep)
     profile = db.execute("SELECT * FROM profiles WHERE contact_id=?", (m["contact_id"],)).fetchone()
     history = thread_text(thread, m) if thread else ""
+    if max_chars is None:  # a connection request's note: LinkedIn's box says the real limit when it's open
+        max_chars = NOTE_CHARS if m["prospect"] else 0
     body, note = personalize(ai, m["base_body"] or m["body"], m, brief, profile,
-                             recent_openers(db, m["campaign_id"], m["id"]), history)
+                             recent_openers(db, m["campaign_id"], m["id"]), history, max_chars)
     db.execute("UPDATE messages SET body=?, ai_at=?, thread=COALESCE(?, thread), updated_at=? WHERE id=?",
                (body, now(), history or None, now(), m["id"]))
     db.commit()
@@ -1079,7 +1188,7 @@ def cmd_replies(db, args, page_factory=None, inbox=None):
 # --------------------------------------------------------------------------
 
 def campaign_messages(db, name, status=None):
-    sql = ("SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position FROM messages m "
+    sql = ("SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position, c.prospect FROM messages m "
            "JOIN campaigns k ON k.id=m.campaign_id JOIN contacts c ON c.id=m.contact_id "
            "WHERE k.name=? AND c.do_not_contact=0")
     params = [name]
@@ -1091,8 +1200,8 @@ def campaign_messages(db, name, status=None):
 
 def message_row(db, message_id):
     """One message as campaign_messages returns it, read fresh from the database."""
-    return db.execute("SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position FROM messages m "
-                      "JOIN contacts c ON c.id=m.contact_id WHERE m.id=?", (message_id,)).fetchone()
+    return db.execute("SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position, c.prospect "
+                      "FROM messages m JOIN contacts c ON c.id=m.contact_id WHERE m.id=?", (message_id,)).fetchone()
 
 
 def cmd_review(db, args):
@@ -1179,6 +1288,12 @@ def network_error(e: BaseException) -> bool:
 def sent_last_24h(db) -> int:
     cutoff = (dt.datetime.now() - dt.timedelta(hours=24)).isoformat(timespec="seconds")
     return db.execute("SELECT COUNT(*) FROM messages WHERE sent_at >= ?", (cutoff,)).fetchone()[0]
+
+
+def invites_last_24h(db) -> int:
+    """Connection requests sent in the last 24 hours, with or without a note."""
+    cutoff = (dt.datetime.now() - dt.timedelta(hours=24)).isoformat(timespec="seconds")
+    return db.execute("SELECT COUNT(*) FROM messages WHERE invited_at >= ?", (cutoff,)).fetchone()[0]
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -1285,12 +1400,29 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
     if room <= 0 and not args.dry_run:
         print(f"Daily cap of {args.daily_cap} already reached - try again later.")
         return
-    batch = queue[:max(room, 0) if not args.dry_run else len(queue)]
-    if args.max:
-        batch = batch[:args.max]
+    # People you aren't connected to get a connection request with the message as its note.
+    # Those count toward the daily cap and have a tighter one of their own.
+    size = min(len(queue) if args.dry_run else max(room, 0), args.max or len(queue))
+    invite_room = len(queue) if args.dry_run else args.invite_cap - invites_last_24h(db)
+    batch, capped = [], 0
+    for m in queue:
+        if len(batch) >= size:
+            break
+        if m["prospect"] == 1:
+            if invite_room <= 0:
+                capped += 1
+                continue
+            invite_room -= 1
+        batch.append(m)
+    if capped:
+        print(f"{capped} connection request(s) wait for later: the cap of {args.invite_cap} per 24h is reached.")
+    if not batch:
+        return
     avg = (args.min_delay + args.max_delay) / 2
+    invites = sum(1 for m in batch if m["prospect"] == 1)
     print(f"{'DRY RUN - nothing will be sent. ' if args.dry_run else ''}"
-          f"{len(batch)} of {len(queue)} draft(s) in '{args.campaign}' this run "
+          f"{len(batch)} of {len(queue)} draft(s) in '{args.campaign}' this run"
+          f"{f', {invites} as connection requests' if invites else ''} "
           f"(cap {args.daily_cap}/24h, {sent_last_24h(db)} already sent). "
           f"Pacing {args.min_delay:.0f}-{args.max_delay:.0f}s between messages, "
           f"about {len(batch) * avg / 60:.0f} min total.")
@@ -1303,7 +1435,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
         def sender_factory():
             return lb.browser(args.profile_dir, headless=args.headless, channel=args.channel)
 
-    sent = held = consecutive = 0
+    sent = held = invited = consecutive = 0
     failed_ids, retried = [], set()
     shots = Path(args.screenshots)
     stop = stop_flag()  # webapp.py's Stop button sends SIGTERM; a stop lands between messages
@@ -1334,7 +1466,26 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                 m = message_row(db, m["id"])  # it may have been personalized on the first try
             who = f"{m['first_name']} {m['last_name']}"
             body = m["body"]
-            rewrite = ai is not None and not m["ai_at"]
+            invite = m["prospect"] == 1
+            blank = invite and getattr(args, "without_note", False)  # the message waits until they accept
+            rewrite = ai is not None and not m["ai_at"] and not blank
+            if m["prospect"] == 2:  # invited without a note earlier: have they accepted?
+                try:
+                    state = sender.connection_state(m["url"])
+                except lb.StopRun as e:
+                    print(f"STOPPED: {e}")
+                    break
+                except Exception as e:
+                    print(f"  ! {who}: couldn't check whether they accepted ({type(e).__name__})")
+                    continue
+                if state != "connected":
+                    print(f"  - {who}: " + ("still waiting for them to accept" if state == "pending" else
+                                            "your invitation is no longer pending; their message stays unsent"))
+                    continue
+                print(f"  {who} accepted your invitation")
+                if not args.dry_run:
+                    db.execute("UPDATE contacts SET prospect=0 WHERE id=?", (m["contact_id"],))
+                    db.commit()
             if rewrite:
                 try:  # their profile first: reading it leaves the page, so before the conversation opens
                     ensure_profile(db, m, page, sleep)
@@ -1343,7 +1494,14 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                 except Exception as e:
                     print(f"  ! {who}: couldn't read the profile ({type(e).__name__}: {e})")
             try:
-                thread = sender.open(m["url"])
+                thread, note_chars = None, 0
+                if invite:
+                    info = sender.open_invite(m["url"], note=not blank)
+                    note_chars = info["limit"]
+                    if info["left"] is not None:
+                        print(f"  LinkedIn says {info['left']} invitation note(s) remain this month")
+                else:
+                    thread = sender.open(m["url"])
                 if thread:
                     print(f"  {len(thread)} earlier message(s) in the conversation with {who}")
                     if not rewrite and not args.dry_run:
@@ -1351,7 +1509,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                         db.commit()
                 if rewrite:
                     try:  # rewrite the draft now, knowing their profile and what was already said
-                        body, note = personalize_message(db, ai, m, brief, thread=thread)
+                        body, note = personalize_message(db, ai, m, brief, thread=thread, max_chars=note_chars)
                         if note.startswith(HELD):
                             print(f"  - {who}: {note}; not sent, marked skipped")
                             held += 1
@@ -1363,7 +1521,20 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                         print(f"  ! {who}: {note}" if note else f"  personalized {who}")
                     except Exception as e:
                         print(f"  ! {who}: couldn't personalize ({type(e).__name__}: {e}); sending the template text")
-                sender.send_text(body, dry_run=args.dry_run)
+                if blank:
+                    sender.send_blank(dry_run=args.dry_run)
+                elif invite:
+                    sender.send_note(body, dry_run=args.dry_run)
+                else:
+                    sender.send_text(body, dry_run=args.dry_run)
+            except lb.AlreadyConnected:
+                print(f"  - {who}: already connected to you, so no request sent; message them in a regular campaign")
+                if not args.dry_run:
+                    db.execute("UPDATE contacts SET prospect=0 WHERE id=?", (m["contact_id"],))
+                    db.execute("UPDATE messages SET status='skipped', error='already connected', updated_at=? "
+                               "WHERE id=?", (now(), m["id"]))
+                    db.commit()
+                continue
             except lb.StopRun as e:
                 print(f"STOPPED: {e}")
                 sender.screenshot(str(shots / f"stopped-{m['contact_id']}.png"))
@@ -1379,7 +1550,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                 sender.screenshot(str(shots / f"failed-{m['contact_id']}.png"))
                 # A slow or half-loaded page fails before anything is sent, so it's safe to try once
                 # more later. Not when the person can't be messaged, or Send was already pressed.
-                if not isinstance(e, (lb.NotReachable, lb.Unconfirmed)) and m["id"] not in retried:
+                if getattr(e, "retry", True) and m["id"] not in retried:
                     retried.add(m["id"])
                     todo.append(m)
                     print(f"  ~ {who}: {msg.splitlines()[0]}; will try once more at the end of the run")
@@ -1396,16 +1567,29 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                     break
                 continue
             consecutive = 0
+            if blank:
+                invited += 1
+                if not args.dry_run:
+                    db.execute("UPDATE contacts SET prospect=2 WHERE id=?", (m["contact_id"],))
+                    db.execute("UPDATE messages SET invited_at=?, error=?, updated_at=? WHERE id=?",
+                               (now(), f"invited without a note on {now()[:10]}; this message goes out once they accept",
+                                now(), m["id"]))
+                    db.commit()
+                print(f"  {'ok' if args.dry_run else 'invited'} {who} without a note"
+                      + (" (dry run - nothing sent)" if args.dry_run else "; their message goes out once they accept"))
+                continue
             sent += 1
             if args.dry_run:
                 print(f"  ok {who} (dry run - typed, not sent)")
             else:
-                db.execute("UPDATE messages SET status='sent', sent_at=?, error=NULL, updated_at=? WHERE id=?",
-                           (now(), now(), m["id"]))
+                db.execute("UPDATE messages SET status='sent', kind=?, invited_at=COALESCE(invited_at, ?), sent_at=?, "
+                           "error=NULL, updated_at=? WHERE id=?",
+                           ("invite" if invite else None, now() if invite else None, now(), now(), m["id"]))
                 db.commit()
-                print(f"  sent {who}")
+                print(f"  {'invited' if invite else 'sent'} {who}")
     verb = "checked" if args.dry_run else "sent"
-    print(f"\nDone: {sent} {verb}, {len(failed_ids)} failed{f', {held} held for you' if held else ''}. "
+    blank = f", {invited} {'checked' if args.dry_run else 'invited'} without a note" if invited else ""
+    print(f"\nDone: {sent} {verb}, {len(failed_ids)} failed{f', {held} held for you' if held else ''}{blank}. "
           f"{len(campaign_messages(db, args.campaign, 'draft'))} draft(s) remaining.")
     if failed_ids and not args.dry_run:
         print(f"Failed messages are marked 'failed' (see `review {args.campaign} --status failed`); "
@@ -1427,6 +1611,15 @@ def build_parser():
     s = sub.add_parser("import", help="import LinkedIn's Connections.csv")
     s.add_argument("csv")
     s.set_defaults(func=cmd_import)
+
+    s = sub.add_parser("add-prospects", help="add people you aren't connected to yet, by profile link, "
+                                              "to send them a connection request with a note")
+    s.add_argument("urls", nargs="*", help="LinkedIn profile links")
+    s.add_argument("--file", help="a file with one link per line, optionally followed by: name, company, title")
+    s.add_argument("--profile-dir", default=None, help="browser profile holding your LinkedIn login")
+    s.add_argument("--channel", choices=["chrome", "msedge"])
+    s.add_argument("--headless", action="store_true", help="hide the browser window")
+    s.set_defaults(func=cmd_add_prospects)
 
     s = sub.add_parser("list", help="list contacts matching filters")
     add_filter_args(s)
@@ -1530,6 +1723,11 @@ def build_parser():
     browser_args(s)
     s.add_argument("--daily-cap", type=int, default=20,
                    help="max messages per rolling 24h across campaigns (default 20)")
+    s.add_argument("--invite-cap", type=int, default=DEFAULT_INVITE_CAP,
+                   help=f"max connection requests per rolling 24h (default {DEFAULT_INVITE_CAP})")
+    s.add_argument("--without-note", action="store_true",
+                   help="send connection requests without a note (for when LinkedIn's monthly notes are used "
+                        "up); each message stays queued and goes out as a normal message once they accept")
     s.add_argument("--max", type=int, help="max messages this run")
     s.add_argument("--min-delay", type=float, default=60, help="min seconds between messages (default 60)")
     s.add_argument("--max-delay", type=float, default=180, help="max seconds between messages (default 180)")

@@ -4,7 +4,8 @@ A command-line tool for messaging your LinkedIn connections, for example to ask
 people to try a new product or to open investor conversations. It handles the
 tedious parts: importing your connections, picking who to contact, drafting a
 personal message for each person, tracking who you've messaged and who replied,
-and moving you through the queue quickly.
+and moving you through the queue quickly. It can also reach people you aren't
+connected to yet, with a connection request that carries a personal note.
 
 There are two ways to send:
 
@@ -250,7 +251,7 @@ time with Ctrl-C, and the next run picks up where it left off.
 | What happens | Result |
 |---|---|
 | Login wall, security check, "unusual activity" or restriction notice | Stops the whole run and saves a screenshot |
-| Not a 1st-degree connection | That message is marked `failed`; the run continues |
+| Not a 1st-degree connection | That message is marked `failed`; the run continues (to reach them, see *Connecting with new people*) |
 | Page didn't load properly, no Message button or message box | Nothing was sent, so that person gets one more try at the end of the run; a second failure is marked `failed` |
 | LinkedIn's "Press Enter to Send" setting is on | Handled: the tool presses Enter instead of clicking Send |
 | Clicked Send but couldn't confirm it went out | Confirmed from the conversation when LinkedIn is just slow; otherwise marked `failed`, never retried automatically, so nobody gets it twice |
@@ -286,6 +287,53 @@ click **Message**, paste and send. Then answer in the terminal:
 | `e` | edit the message (uses `$EDITOR` if set) |
 | `x` | never contact this person |
 | `q` | quit; pick up where you left off next time |
+
+## Connecting with new people
+
+Messages only reach your connections. For anyone else, the tool sends a
+**connection request with a note**: the same draft, review and send flow, with
+the message as the note.
+
+```bash
+# add people by profile link; a name after the link saves opening the profile
+python outreach.py add-prospects "https://www.linkedin.com/in/someone" \
+  "https://www.linkedin.com/in/someone-else, Jane Doe, Acme, CTO"
+python outreach.py add-prospects --file links.txt
+
+python outreach.py list --prospects
+python outreach.py draft intros --prospects --template templates/connect-note.txt \
+  --sender-name "Sam" --var product="Acme"
+python outreach.py autosend intros --dry-run     # types each note, then cancels
+python outreach.py autosend intros --personalize
+```
+
+On the web page, paste the links under **Add people you're not connected to
+yet**, then choose **Not connected yet** under *Who* before writing.
+
+What to know:
+
+- **The note is short.** LinkedIn's box takes 200 characters on a free account
+  and 300 with Premium. The tool reads the real limit from the box, has Claude
+  write to it when personalizing, and refuses a note that doesn't fit rather
+  than cutting it off.
+- **Free accounts get only a few notes a month.** LinkedIn shows how many are
+  left and the run prints it. When LinkedIn stops offering a note, the run
+  stops: an invitation never goes out without its note unless you ask for that.
+- **Out of notes? Connect first, message after.** `autosend intros
+  --without-note` sends the requests with no note and keeps each message
+  queued. Later runs check who accepted and send those people their message as
+  a normal message, which has no 200-character limit. People who haven't
+  answered are left alone, and nobody is invited twice.
+- **Requests have their own cap**, `--invite-cap` (15 per 24 hours by default),
+  on top of the daily cap. LinkedIn allows roughly 100 requests a week.
+- **Only their own Connect button is used.** A profile's sidebar suggests other
+  people with Connect buttons of their own; the tool matches the button to the
+  profile's owner.
+- **People in the two groups never mix.** A campaign is drafted either for your
+  connections or, with `--prospects`, for people you've added. Someone who turns
+  out to be connected already is skipped and moved to your connections, and so
+  is anyone who shows up in your next connections import after accepting.
+- A reply after they accept is picked up by `replies` like any other.
 
 ## 5. Track replies
 

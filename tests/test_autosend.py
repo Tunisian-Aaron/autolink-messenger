@@ -86,6 +86,65 @@ LINK = '<a href="/messaging/compose/?recipient={slug}&interop=msgOverlay">Messag
 BUTTON = '<button aria-label="Message {name}">Message</button>'
 PREMIUM = '<a href="/messaging/compose/?recipient={slug}&premium=1" aria-label="Message with Premium">Say hello</a>'
 
+# Someone you aren't connected to: Connect is a link to the invite page (or, in another layout,
+# a button), and the sidebar has a Connect button for somebody else that must never be used.
+DECOY = ("""<button aria-label="Invite Someone Else to connect" onclick="fetch('/sent', {{method: 'POST', """
+         """body: JSON.stringify({{who: 'WRONG PERSON', text: ''}})}})">Connect</button>""")
+CONNECT = ('<a aria-label="Invite {name} to connect" href="/preload/custom-invite/?vanityName={slug}">Connect</a>'
+           + DECOY)
+CONNECT_BUTTON = ("""<span></span><button aria-label="Invite {name} to connect" """
+                  """onclick="location.href='/preload/custom-invite/?vanityName={slug}'">Connect</button>""" + DECOY)
+
+# A third layout: Connect is a link back to the profile that opens a <dialog> in place (with a
+# hidden twin), and on follow-first profiles it is a plain "Connect" entry in the More menu.
+IN_PLACE = """<script>
+function invite() {{
+  const d = document.createElement('dialog');
+  d.innerHTML = '<h2>Add a note to your invitation?</h2><button aria-label="Dismiss">x</button>'
+    + '<button>Add a note</button><button id="nonote">Send without a note</button>';
+  document.body.append(d); d.show();
+  d.querySelector('#nonote').onclick = async () => {{
+    await fetch('/sent', {{method: 'POST', body: JSON.stringify({{who: '{slug}', text: '', nonote: true}})}});
+    d.remove(); }};
+  d.querySelector('[aria-label=Dismiss]').onclick = () => d.remove();
+  return false;
+}}
+function more() {{
+  const m = document.createElement('div');
+  m.setAttribute('role', 'menu');
+  m.innerHTML = '<a role="menuitem" href="/{slug}">Send profile in a message</a><a role="menuitem" href="/{slug}"> Connect </a>';
+  m.lastChild.onclick = invite;
+  document.body.append(m);
+}}
+</script>"""
+CONNECT_IN_PLACE = ('<a aria-label="Invite {name} to connect" href="/{slug}" hidden>Connect</a>'
+                    '<a aria-label="Invite {name} to connect" href="/{slug}" onclick="return invite()">Connect</a>'
+                    + IN_PLACE + DECOY)
+CONNECT_IN_MENU = '<button>Follow</button><button aria-label="More" onclick="more()"></button>' + IN_PLACE + DECOY
+
+# The invite page: "Add a note" reveals the note box, its counter and how many notes are left.
+INVITE_PAGE = """<!doctype html><html><body><main>
+<div role="dialog" class="artdeco-modal send-invite"><h2>Add a note to your invitation?</h2>
+<button aria-label="Dismiss">x</button>
+<div id="step1"><button id="add">Add a note</button><button id="nonote">Send without a note</button></div>
+<div id="step2" hidden>{step2}</div></div></main>
+<script>
+const post = o => fetch('/sent', {{method: 'POST', body: JSON.stringify(Object.assign({{who: '{slug}'}}, o))}});
+const dialog = document.querySelector('[role=dialog]'), box = document.getElementById('custom-message');
+document.getElementById('add').onclick = () => {{ step1.hidden = true; step2.hidden = false; }};
+document.getElementById('nonote').onclick = async () => {{ await post({{text: '', nonote: true}}); dialog.remove(); }};
+if (box) {{
+  box.oninput = () => {{ send.disabled = !box.value.trim(); count.innerText = box.value.length + '/200'; }};
+  send.onclick = async () => {{ await post({{text: box.value, invite: true}}); dialog.remove(); }};
+  cancel.onclick = () => dialog.remove();
+}}
+</script></body></html>"""
+NOTE_STEP = """<p>3 personalized invitations remaining for this month.</p>
+<textarea id="custom-message" name="message"></textarea><span id="count">0/200</span>
+<button aria-label="Cancel adding a note" id="cancel">Cancel</button>
+<button aria-label="Send invitation" id="send" disabled>Send</button>"""
+NO_NOTES_LEFT = "<p>You've used all your personalized invitations this month.</p><button>Reactivate Premium</button>"
+
 # An existing conversation above the composer, as LinkedIn renders it: the sender's name only
 # on the first message of a run.
 THREAD = """<ul class="msg-s-message-list-content">
@@ -106,6 +165,13 @@ PAGES = {
     "nomsg": dict(name="Maria Gomez", degree="1st", button='<button>Follow</button>', stuck="false", thread=""),
     "stuck": dict(name="Tom Lee", degree="1st", button=LINK, stuck="true", thread=""),
     "second": dict(name="Ava Second", degree="2nd", button=PREMIUM, stuck="false", thread=""),
+    "p1": dict(name="Pat Prospect", degree="2nd", button=CONNECT, stuck="false", thread=""),
+    "p2": dict(name="Quin Prospect", degree="3rd", button=CONNECT_BUTTON, stuck="false", thread=""),
+    "p3": dict(name="Rae Prospect", degree="2nd", button=CONNECT_IN_PLACE, stuck="false", thread=""),
+    "p4": dict(name="Sy Prospect", degree="2nd", button=CONNECT_IN_MENU, stuck="false", thread=""),
+    "nonotes": dict(name="Nat Nonotes", degree="2nd", button=CONNECT, stuck="false", thread=""),
+    "pending": dict(name="Pat Prospect", degree="2nd", button="<span></span><button disabled>Pending</button>",
+                    stuck="false", thread=""),
     "flaky": dict(name="Flo Flaky", degree="1st", button=LINK, stuck="false", thread=""),
     "slow": dict(name="Sol Slow", degree="1st", button=LINK, stuck="false", thread="", composer=SLOW_COMPOSER),
     "enter": dict(name="Eve Enter", degree="1st", button=LINK, stuck="false", thread="", composer=ENTER_COMPOSER),
@@ -138,7 +204,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode())
             return
-        if self.path.startswith("/messaging/compose/"):
+        if self.path.startswith("/preload/custom-invite/"):
+            slug = self.path.split("vanityName=")[1]
+            html = INVITE_PAGE.format(slug=slug, step2=NO_NOTES_LEFT if slug == "nonotes" else NOTE_STEP)
+        elif self.path.startswith("/messaging/compose/"):
             q = dict(p.split("=") for p in self.path.split("?")[1].split("&"))
             if "premium" in q:
                 html = "<html><body><main><h2>InMail</h2><p>Buy Premium to send InMail.</p></main></body></html>"
@@ -281,6 +350,136 @@ class AutosendTest(unittest.TestCase):
             linkedin_browser.LinkedInSender.__init__ = orig
         self.assertEqual([s["who"] for s in Handler.sent], ["ok1", "flaky"])
         self.assertEqual(set(self.statuses(db)[i] for i in ids[:2]), {"sent"})
+
+    # -- connection requests with a note ------------------------------------
+    NOTE = "Hi there, short note about P. Sam"
+
+    def prospects(self, slugs, n=None, note=None):
+        """Point contacts at these pages; the first n (default all) aren't connections yet."""
+        db, ids = self.point_contacts(slugs)
+        for cid in ids[:len(slugs) if n is None else n]:
+            db.execute("UPDATE contacts SET prospect=1 WHERE id=?", (cid,))
+            db.execute("UPDATE messages SET body=?, base_body=? WHERE contact_id=?", (note or self.NOTE,) * 2 + (cid,))
+        db.commit()
+        return db, ids
+
+    def test_invites_with_the_note(self):
+        # p1: Connect is a link; p2: a button. ok1 is a connection and gets a normal message.
+        db, ids = self.prospects(["p1", "p2", "ok1"], n=2)
+        self.autosend(db)
+        self.assertEqual([(s["who"], s.get("invite", False)) for s in Handler.sent],
+                         [("p1", True), ("p2", True), ("ok1", False)])  # never the sidebar's "WRONG PERSON"
+        self.assertEqual([s["text"] for s in Handler.sent[:2]], [self.NOTE] * 2)
+        self.assertFalse(any(s.get("nonote") for s in Handler.sent))
+        kinds = [db.execute("SELECT status, kind FROM messages WHERE contact_id=?", (i,)).fetchone() for i in ids[:3]]
+        self.assertEqual([tuple(k) for k in kinds], [("sent", "invite"), ("sent", "invite"), ("sent", None)])
+        self.assertEqual(outreach.invites_last_24h(db), 2)
+
+    def test_invite_without_note_then_message_once_they_accept(self):
+        db, ids = self.prospects(["p1"])
+        state = lambda: tuple(db.execute(  # noqa: E731
+            "SELECT m.status, c.prospect, m.invited_at IS NOT NULL FROM messages m JOIN contacts c ON c.id=m.contact_id "
+            "WHERE c.id=?", (ids[0],)).fetchone())
+        self.autosend(db, "--without-note")
+        self.assertEqual(Handler.sent, [{"who": "p1", "text": "", "nonote": True}])
+        self.assertEqual(state(), ("draft", 2, 1))  # invited; the message is still waiting
+        self.assertEqual(outreach.invites_last_24h(db), 1)
+
+        db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + "pending", ids[0]))
+        db.commit()
+        self.autosend(db, "--without-note")  # not accepted yet: nothing more happens, and no second invitation
+        self.assertEqual(len(Handler.sent), 1)
+        self.assertEqual(state(), ("draft", 2, 1))
+
+        db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + "ok1", ids[0]))  # now a 1st-degree profile
+        db.commit()
+        self.autosend(db)
+        self.assertEqual(Handler.sent[1:], [{"who": "ok1", "text": self.NOTE}])  # the message, as a message
+        self.assertEqual(state(), ("sent", 0, 1))
+
+    def test_invite_from_a_dialog_opened_in_place(self):
+        # p3: Connect links back to the profile and opens the dialog there; p4: Connect is in the More menu
+        db, ids = self.prospects(["p3", "p4"])
+        self.autosend(db, "--without-note")
+        self.assertEqual(Handler.sent, [{"who": "p3", "text": "", "nonote": True},
+                                        {"who": "p4", "text": "", "nonote": True}])
+        self.assertEqual(Handler.visits["p3"], 1)  # the link was clicked, not loaded as a page
+
+    def test_invite_dry_run_sends_nothing(self):
+        db, ids = self.prospects(["p1"])
+        self.autosend(db, "--dry-run")
+        self.assertEqual(Handler.sent, [])
+        self.assertEqual(self.statuses(db)[ids[0]], "draft")
+
+    def test_invite_refuses_a_note_that_is_too_long(self):
+        db, ids = self.prospects(["p1"], note="x" * 201)
+        self.autosend(db)
+        self.assertEqual(Handler.sent, [])  # not cut off, not sent without a note
+        row = db.execute("SELECT status, error FROM messages WHERE contact_id=?", (ids[0],)).fetchone()
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("201 characters; LinkedIn allows 200", row["error"])
+
+    def test_invite_skips_someone_already_connected(self):
+        db, ids = self.prospects(["ok1"])
+        self.autosend(db)
+        self.assertEqual(Handler.sent, [])
+        self.assertEqual(self.statuses(db)[ids[0]], "skipped")
+        self.assertEqual(db.execute("SELECT prospect FROM contacts WHERE id=?", (ids[0],)).fetchone()[0], 0)
+
+    def test_invites_stop_when_linkedin_offers_no_note(self):
+        db, ids = self.prospects(["nonotes", "p1"])
+        import linkedin_browser
+        orig = linkedin_browser.LinkedInSender.__init__
+        linkedin_browser.LinkedInSender.__init__ = lambda s, p, **k: orig(s, p, timeout_s=5, confirm_timeout_s=5)
+        try:
+            self.autosend(db)
+        finally:
+            linkedin_browser.LinkedInSender.__init__ = orig
+        self.assertEqual(Handler.sent, [])  # the run stops instead of inviting people without a note
+        self.assertEqual([self.statuses(db)[i] for i in ids[:2]], ["draft", "draft"])
+
+    def test_invite_cap(self):
+        db, ids = self.prospects(["p1", "p2", "ok1"], n=2)
+        self.autosend(db, "--invite-cap", "1")
+        self.assertEqual([s["who"] for s in Handler.sent], ["p1", "ok1"])  # the message still goes
+        self.assertEqual(self.statuses(db)[ids[1]], "draft")
+
+    def test_invite_note_is_personalized_within_the_limit(self):
+        class FakeClaude:
+            name = "fake"
+            prompts = []
+
+            def generate(self, prompt):
+                self.prompts.append(prompt)
+                if "Reply with exactly NONE" in prompt:
+                    return "NONE"
+                name = re.search(r"Name: (\S+)", prompt).group(1)
+                return f"Hi {name}, loved your ten years in the field. Sam" if len(self.prompts) > 1 else "x" * 300
+        db, ids = self.prospects(["p1"])
+        db.execute("UPDATE campaigns SET brief='Connect with builders'")
+        db.commit()
+        ai = FakeClaude()
+        args = outreach.build_parser().parse_args(
+            ["--db", self.dbpath, "autosend", "c", "--headless", "--yes", "--min-delay", "0", "--max-delay", "0",
+             "--personalize", "--profile-dir", str(Path(self.tmp.name) / "profile"),
+             "--screenshots", str(Path(self.tmp.name) / "shots")])
+        outreach.cmd_autosend(db, args, sleep=lambda s: None, ai=ai)
+        self.assertIn("At most 200 characters", ai.prompts[0])  # the limit LinkedIn's box showed
+        self.assertIn("connection request", ai.prompts[0])
+        self.assertIn("300 characters; LinkedIn's note box takes 200", ai.prompts[1])  # first try was too long
+        self.assertRegex(Handler.sent[0]["text"], r"^Hi \w+, loved your ten years in the field\. Sam$")
+        self.assertEqual(len(Handler.sent), 1)
+
+    def test_add_prospects_reads_names_from_profiles(self):
+        db = outreach.connect(self.dbpath)
+        args = outreach.build_parser().parse_args(
+            ["--db", self.dbpath, "add-prospects", self.base + "p1", self.base + "ok1", "--headless",
+             "--profile-dir", str(Path(self.tmp.name) / "profile")])
+        outreach.cmd_add_prospects(db, args, sleep=lambda s: None)
+        rows = {r["first_name"]: r for r in db.execute("SELECT * FROM contacts WHERE url LIKE ?", (self.base + "%",))}
+        self.assertEqual((rows["Pat"]["last_name"], rows["Pat"]["prospect"], rows["Pat"]["position"]),
+                         ("Prospect", 1, "Some headline"))
+        self.assertEqual(rows["Jane"]["prospect"], 0)  # ok1 turned out to be a connection already
 
     def test_send_confirmed_by_the_conversation(self):
         db, ids = self.point_contacts(["slow"])

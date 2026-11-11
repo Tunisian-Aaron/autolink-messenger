@@ -118,7 +118,8 @@ class App:
             exclude_title=self._list(f.get("exclude_title")),
             tag=self._list(f.get("tag")), exclude_tag=self._list(f.get("exclude_tag")),
             since=f.get("since") or None, before=f.get("before") or None,
-            ids=f.get("ids") or None, limit=int(f["limit"]) if f.get("limit") else None)
+            ids=f.get("ids") or None, limit=int(f["limit"]) if f.get("limit") else None,
+            prospects=bool(f.get("prospects")))
         for k, v in extra.items():
             setattr(ns, k, v)
         return ns
@@ -133,7 +134,7 @@ class App:
         for flag, value in (("--since", ns.since), ("--before", ns.before), ("--ids", ns.ids), ("--limit", ns.limit)):
             if value:
                 argv += [flag, str(value)]
-        return argv
+        return argv + (["--prospects"] if ns.prospects else [])
 
     def draft_ns(self, b: dict, dry_run: bool):
         campaign = (b.get("campaign") or "").strip()
@@ -190,7 +191,8 @@ class App:
                      for p in sorted((HERE / "templates").glob("*.txt"))}
         job = self.job
         return {
-            "contacts": db.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+            "contacts": db.execute("SELECT COUNT(*) FROM contacts WHERE prospect=0").fetchone()[0],
+            "prospects": db.execute("SELECT COUNT(*) FROM contacts WHERE prospect>0").fetchone()[0],
             "do_not_contact": db.execute("SELECT COUNT(*) FROM contacts WHERE do_not_contact=1").fetchone()[0],
             "sent_24h": outreach.sent_last_24h(db),
             "campaigns": camps,
@@ -218,6 +220,14 @@ class App:
 
     def browser_opts(self):
         return ["--profile-dir", self.profile_dir] + (["--channel", self.channel] if self.channel else [])
+
+    def api_add_prospects(self, b):
+        lines = [ln.strip() for ln in (b.get("links") or "").splitlines() if ln.strip()][:200]
+        if not outreach.parse_prospects("\n".join(lines)):
+            raise ApiError("Paste at least one LinkedIn profile link, like https://www.linkedin.com/in/someone")
+        # "--" ends the options, so a pasted line can never be read as one
+        self.start_process_job("adding people", self.outreach_cmd("add-prospects", *self.browser_opts(), "--", *lines))
+        return {"ok": True}
 
     def api_import_linkedin(self, b):
         cmd = self.outreach_cmd("import-linkedin", *self.browser_opts())
@@ -326,7 +336,7 @@ class App:
         rows = outreach.campaign_messages(self.db(), b.get("campaign") or "", b.get("status") or None)
         return {"messages": [{k: r[k] for k in ("id", "contact_id", "first_name", "last_name", "url",
                                                  "company", "position", "status", "body", "error",
-                                                 "sent_at", "ai_at", "thread")} for r in rows]}
+                                                 "sent_at", "ai_at", "thread", "prospect")} for r in rows]}
 
     def api_update_message(self, b):
         db = self.db()
@@ -385,6 +395,8 @@ class App:
             argv.append("--headless")
         if b.get("personalize"):
             argv.append("--personalize")
+        if b.get("without_note"):
+            argv.append("--without-note")
         if self.channel:
             argv += ["--channel", self.channel]
         if not campaign:
@@ -403,6 +415,7 @@ class App:
 
     ROUTES = {
         "state": api_state, "import": api_import, "import/linkedin": api_import_linkedin, "contacts": api_contacts,
+        "prospects": api_add_prospects,
         "tag": api_tag, "personalize": api_personalize, "replies": api_replies,
         "campaign/delete-drafts": api_delete_drafts, "campaign/delete": api_delete_campaign,
         "preview": api_preview, "draft": api_draft, "messages": api_messages,

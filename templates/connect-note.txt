@@ -1,0 +1,3 @@
+Hi {first_name}, I'm building {sender_product} and your work at {company|your company} caught my eye. I'd like to connect and hear how you see this space.
+
+{sender_name}

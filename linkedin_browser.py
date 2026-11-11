@@ -20,7 +20,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 DEFAULT_PROFILE_DIR = os.environ.get(
     "OUTREACH_BROWSER_PROFILE", str(Path.home() / ".outreach-linkedin-profile"))
@@ -57,6 +57,23 @@ SEND_BUTTON = [
 # this hint sits where it was (seen 2026-11-08).
 ENTER_TO_SEND = [("text", r"press enter to send")]
 CLOSE_OVERLAY = "button[aria-label*='Close your conversation'], button[aria-label*='Close your draft']"
+
+# Connection requests with a note (seen 2026-11-10). "Connect" on a profile is a link to
+# /preload/custom-invite/?vanityName=<their slug>, a page showing the dialog "Add a note to your
+# invitation?" with the buttons "Add a note" and "Send without a note". "Add a note" reveals a
+# textarea, a counter ("0/200" on a free account, 300 with Premium) and, on free accounts, how
+# many notes are left this month. The profile's sidebar has Connect buttons for OTHER people
+# ("Invite <someone else> to connect"), so Connect is always matched to the profile's owner.
+INVITE_LINK = "a[href*='/preload/custom-invite/']"
+INVITE_DIALOG = "[role='dialog'], dialog[open]"
+ADD_NOTE = [("role", "button", r"^add a note$")]
+SEND_BLANK = [("role", "button", r"^send without a note$")]  # only ever clicked when asked to
+NOTE_BOX = [("css", "textarea#custom-message, textarea[name='message']")]
+SEND_INVITE = [("role", "button", r"^send invitation$"), ("role", "button", r"^send$")]
+CANCEL_NOTE = [("role", "button", r"^cancel adding a note$"), ("role", "button", r"^(cancel|dismiss)$")]
+NOTE_COUNTER = re.compile(r"\b\d{1,4}\s*/\s*(\d{2,4})\b")  # "0/200": the second number is the limit
+NOTES_LEFT = re.compile(r"(\d+) personalized invitations? remaining", re.I)
+NOTE_FALLBACK_LIMIT = 200
 # The conversation above the composer: a date heading per day, then one list item per message,
 # the sender's name only on the first of a run of messages from the same person.
 THREAD_JS = """() => {
@@ -111,15 +128,32 @@ class StopRun(Exception):
 
 
 class SendError(Exception):
-    """This one message couldn't be sent; the run can continue."""
+    """This one message couldn't be sent; the run can continue. `retry` says whether trying
+    again later can help: yes for a page that didn't load, no when the answer won't change."""
+    retry = True
 
 
 class NotReachable(SendError):
-    """You can't message this person at all (not a 1st-degree connection): retrying won't help."""
+    """You can't reach this person this way (not a 1st-degree connection, no Connect option)."""
+    retry = False
+
+
+class AlreadyConnected(NotReachable):
+    """No connection request needed: this person is already a 1st-degree connection."""
+
+
+class InvitePending(NotReachable):
+    """Your connection request to this person is still waiting for their answer."""
+
+
+class NoteTooLong(SendError):
+    """The note has more characters than LinkedIn's box takes."""
+    retry = False
 
 
 class Unconfirmed(SendError):
     """Send was pressed but LinkedIn never confirmed it: never retry, or they may get it twice."""
+    retry = False
 
 
 @contextlib.contextmanager
@@ -298,6 +332,164 @@ class LinkedInSender:
         raise Unconfirmed("clicked Send but couldn't confirm the message went out - check the "
                         "conversation in LinkedIn before retrying")
 
+    # -- connection requests ---------------------------------------------------
+    def _connect_control(self, profile_url: str, name: str):
+        """The profile owner's own Connect link or button: by their slug in the link, else by
+        the label "Invite <their name> to connect". Never anyone else's."""
+        slug = unquote(urlparse(profile_url).path.rstrip("/").split("/")[-1]).lower()
+        label = re.compile(r"^invite\s+" + r"\s+".join(map(re.escape, name.split())) + r"\s+to connect\s*$", re.I)
+
+        def find():
+            links = self.page.locator(INVITE_LINK)
+            for i in range(min(links.count(), 10)):
+                query = parse_qs(urlparse(links.nth(i).get_attribute("href") or "").query)
+                if slug and (query.get("vanityName") or [""])[0].lower() == slug:
+                    return links.nth(i)  # a link works even while tucked away in the More menu
+            if name:
+                for role in ("link", "button"):
+                    found = self.page.get_by_role(role, name=label)
+                    for i in range(min(found.count(), 5)):
+                        if found.nth(i).is_visible():
+                            return found.nth(i)
+            if opened_more:  # their own More menu, opened below: its entry just says "Connect"
+                items = self.page.locator("[role='menuitem']")
+                for i in range(min(items.count(), 15)):
+                    if items.nth(i).is_visible() and items.nth(i).inner_text().strip().lower() == "connect":
+                        return items.nth(i)
+            return None
+
+        opened_more = False
+        deadline = time.monotonic() + self.timeout_s
+        while time.monotonic() < deadline:
+            control = find()
+            if control is not None:
+                return control
+            if not opened_more:  # some profiles keep Connect behind "More"
+                opened_more = True
+                with contextlib.suppress(Exception):
+                    more = self.page.locator("main").get_by_role("button", name=re.compile(r"^more( actions)?$", re.I))
+                    if more.count() and more.first.is_visible():
+                        more.first.click(timeout=2000)
+            time.sleep(0.25)
+        top = main_lines(self.page)[:30]
+        if "Pending" in top:
+            raise InvitePending("your invitation to them is already pending")
+        raise SendError("couldn't find their Connect button (they may only allow followers)")
+
+    def connection_state(self, profile_url: str) -> str:
+        """'connected' (1st degree), 'pending' (your invitation awaits their answer) or 'open'."""
+        self.page.goto(profile_url, wait_until="domcontentloaded")
+        self.check_blocked()
+        lines = _wait_for_text(self.page, lambda ls: bool(top_card(ls)["degree"]), self.timeout_s)
+        if "1st" in top_card(lines)["degree"]:
+            return "connected"
+        return "pending" if "Pending" in lines[:30] else "open"
+
+    def open_invite(self, profile_url: str, note: bool = True) -> dict:
+        """Open the connection request for this person, up to the note box, without sending.
+        Returns {"limit": characters the note may have, "left": how many notes LinkedIn says
+        remain this month (None when it doesn't say)}. With note=False it stops at the first
+        step, ready for `send_blank`."""
+        if not profile_url:
+            raise NotReachable("contact has no profile URL")
+        self.page.goto(profile_url, wait_until="domcontentloaded")
+        self.check_blocked()
+        self._close_overlays()
+        card = top_card(_wait_for_text(self.page, lambda ls: bool(top_card(ls)["degree"]), self.timeout_s))
+        if "1st" in card["degree"]:
+            raise AlreadyConnected("already a 1st-degree connection")
+        control = self._connect_control(profile_url, card["name"])
+        href = control.get_attribute("href") or ""
+        if "/preload/custom-invite/" in href:  # a link to the invitation page: safe to load
+            self.page.goto(urljoin(self.page.url, href), wait_until="domcontentloaded")
+            self.check_blocked()
+        else:  # a button, or a link back to the profile, that opens the dialog in place
+            control.click()
+        dialog = self._first_visible([("css", INVITE_DIALOG)], "invitation dialog")
+        if not note:
+            self._first_visible(SEND_BLANK, "Send without a note button")
+            return {"limit": 0, "left": None}
+        if self._visible_now(NOTE_BOX) is None:
+            add = self._visible_now(ADD_NOTE) or self._first_visible(ADD_NOTE + NOTE_BOX, "Add a note button", 5)
+            if self._visible_now(NOTE_BOX) is None:
+                add.click()
+        try:
+            self._note_box = self._first_visible(NOTE_BOX, "note box", 8)
+        except SendError:
+            said = " ".join(dialog.inner_text().split())[:200]
+            # No note box usually means the month's notes are used up. Stop, so the run never
+            # turns into invitations without a note.
+            raise StopRun(f"LinkedIn isn't offering a note on invitations right now ({said}). To send requests "
+                          "without one and message people once they accept, use --without-note.") from None
+        text = dialog.inner_text()
+        counter, left = NOTE_COUNTER.search(text), NOTES_LEFT.search(text)
+        limit = int(self._note_box.get_attribute("maxlength") or 0) or (int(counter.group(1)) if counter else 0)
+        self._note_limit = limit or NOTE_FALLBACK_LIMIT
+        return {"limit": self._note_limit, "left": int(left.group(1)) if left else None}
+
+    def send_note(self, body: str, dry_run: bool = False):
+        """Type the note into the dialog opened by `open_invite` and send the invitation."""
+        box = self._note_box
+        if len(body) > self._note_limit:
+            self._cancel_invite()
+            raise NoteTooLong(f"the note is {len(body)} characters; LinkedIn allows {self._note_limit} here")
+        box.click()
+        self._clear_focused()
+        self.page.keyboard.insert_text(body)
+        if box.input_value().replace("\r\n", "\n").strip() != body.strip():
+            self._cancel_invite()
+            raise SendError("the note box doesn't hold the note as written")
+        if dry_run:
+            self._cancel_invite()
+            return
+        send_btn = self._first_visible(SEND_INVITE, "Send invitation button")
+        deadline = time.monotonic() + 5
+        while not send_btn.is_enabled() and time.monotonic() < deadline:
+            time.sleep(0.25)
+        if not send_btn.is_enabled():
+            self._cancel_invite()
+            raise SendError("Send stayed disabled after typing the note")
+        send_btn.click()
+        self._confirm_invite(NOTE_BOX)
+
+    def send_blank(self, dry_run: bool = False):
+        """Send the invitation opened by `open_invite(note=False)` with no note."""
+        if dry_run:
+            self._cancel_invite()
+            return
+        self._first_visible(SEND_BLANK, "Send without a note button").click()
+        self._confirm_invite(SEND_BLANK)
+
+    def _confirm_invite(self, open_specs):
+        """LinkedIn closes the dialog once it has taken the invitation. A dialog that takes its
+        place instead (the weekly limit, a request for their email) means it didn't go."""
+        deadline = time.monotonic() + self.confirm_timeout_s
+        while time.monotonic() < deadline:
+            if self._visible_now(open_specs) is None:
+                self.check_blocked()
+                time.sleep(1)
+                said = ""
+                with contextlib.suppress(Exception):
+                    left = self._visible_now([("css", INVITE_DIALOG)])
+                    said = " ".join(left.inner_text(timeout=1000).split()) if left is not None else ""
+                if "limit" in said.lower():
+                    raise StopRun(f"LinkedIn refused the invitation: {said[:200]}")
+                if said:
+                    raise Unconfirmed(f"LinkedIn answered the invitation with: {said[:200]}")
+                return
+            time.sleep(0.5)
+        raise Unconfirmed("clicked Send but couldn't confirm the invitation went out - check their "
+                          "profile in LinkedIn (it shows Pending when it did) before retrying")
+
+    def _cancel_invite(self):
+        """Close the invitation dialog without sending anything."""
+        with contextlib.suppress(Exception):
+            btn = self._visible_now(CANCEL_NOTE)
+            if btn is not None:
+                btn.click(timeout=2000)
+            else:
+                self.page.keyboard.press("Escape")
+
     def _in_thread(self, snippet: str) -> bool:
         with contextlib.suppress(Exception):
             return bool(snippet) and any(snippet in " ".join(m["text"].split())
@@ -326,6 +518,13 @@ def top_card(lines: list[str]) -> dict:
     rest = [l for l in head[badge + 1:] if l not in ("·", "Contact info")]
     return {"name": head[0] if badge else "", "degree": head[badge],
             "headline": rest[0] if rest else "", "location": rest[1] if len(rest) > 1 else ""}
+
+
+def read_card(page, url: str) -> dict:
+    """Just the top of a profile: {"name", "degree", "headline", "location"}. One page load."""
+    page.goto(url.rstrip("/"), wait_until="domcontentloaded")
+    LinkedInSender(page).check_blocked()
+    return top_card(_wait_for_text(page, lambda ls: bool(top_card(ls)["degree"])))
 
 
 def section_text(lines: list[str], heading: str, limit: int) -> str:

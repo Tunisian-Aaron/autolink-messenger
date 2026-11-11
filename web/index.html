@@ -155,9 +155,24 @@ other: none of the above"></textarea>
   </div>
 
   <div class="card">
+    <h2>Add people you're not connected to yet</h2>
+    <p class="hint">Paste LinkedIn profile links, one per line. A campaign written for these people goes out as <b>connection requests, with your message as the note</b>. A name after the link (<code>link, First Last</code>) saves opening the profile to read it. LinkedIn gives a note 200 characters (300 with Premium) and free accounts only a few notes a month; the tool reads both from LinkedIn as it sends and never sends a request without its note.</p>
+    <textarea id="pr-links" rows="3" placeholder="https://www.linkedin.com/in/someone
+https://www.linkedin.com/in/someone-else, Jane Doe"></textarea>
+    <div class="row">
+      <button class="btn primary" id="btn-prospects">Add these people</button>
+      <button class="btn danger" id="btn-prospects-stop" style="display:none">Stop</button>
+      <span class="count" id="prospects-count"></span>
+    </div>
+    <div class="msg" id="prospects-msg"></div>
+    <pre class="log" id="prospects-log" style="display:none"></pre>
+  </div>
+
+  <div class="card">
     <h2>Choose who to message</h2>
     <p class="hint">Separate several values with commas; any one of them matching counts. These filters decide who gets the campaign you write next.</p>
     <div class="grid">
+      <div><label>Who</label><select id="f-prospects"><option value="">My connections (a message)</option><option value="1">Not connected yet (a connection request with a note)</option></select></div>
       <div><label>Title includes</label><input id="f-title" placeholder="founder, head of, cto"></div>
       <div><label>Company includes</label><input id="f-company" placeholder="optional"></div>
       <div><label>Title excludes</label><input id="f-exclude_title" placeholder="recruiter, student"></div>
@@ -257,6 +272,7 @@ other: none of the above"></textarea>
     </div>
     <div class="row">
       <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-personalize"> Personalize each message from their profile right before sending (needs the campaign's brief on the Review tab)</label>
+      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-nonote"> Send connection requests without a note (for when LinkedIn's monthly notes run out); each message then goes out once the person accepts</label>
       <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-headless"> Hide the browser window</label>
     </div>
     <div class="row">
@@ -349,7 +365,8 @@ function renderStats() {
 }
 
 // ---------- contacts ----------
-const FILTERS = ['title', 'company', 'exclude_title', 'exclude_company', 'tag', 'exclude_tag', 'since', 'limit'];
+const FILTERS = ['prospects', 'title', 'company', 'exclude_title', 'exclude_company', 'tag', 'exclude_tag', 'since', 'limit'];
+const NOTE_CHARS = 200;  // a connection request's note on a free LinkedIn account (300 with Premium)
 function filters() { const f = {}; FILTERS.forEach(k => f[k] = $('f-' + k).value.trim()); return f; }
 FILTERS.forEach(k => { $('f-' + k).value = store.get('f-' + k, ''); $('f-' + k).oninput = () => store.set('f-' + k, $('f-' + k).value); });
 
@@ -364,6 +381,11 @@ $('btn-import-li').onclick = () => guard($('btn-import-li'), async () => {
   hide('import-li-msg'); await api('import/linkedin', { max: $('li-max').value }); startPolling();
 }, 'import-li-msg');
 $('btn-import-li-stop').onclick = () => api('stop');
+
+$('btn-prospects').onclick = () => guard($('btn-prospects'), async () => {
+  hide('prospects-msg'); await api('prospects', { links: $('pr-links').value }); startPolling();
+}, 'prospects-msg');
+$('btn-prospects-stop').onclick = () => api('stop');
 
 $('t-spec').value = store.get('tag-spec', ''); $('t-spec').oninput = () => store.set('tag-spec', $('t-spec').value);
 $('btn-tag').onclick = () => guard($('btn-tag'), async () => {
@@ -409,7 +431,10 @@ function senderVars() {
 }
 function onTemplate() {
   store.set('template', $('w-template').value);
-  $('w-chars').textContent = `${$('w-template').value.length} characters`;
+  const n = $('w-template').value.length;
+  $('w-chars').textContent = filters().prospects
+    ? `${n} characters before names are filled in. A connection request's note takes ${NOTE_CHARS} (300 with Premium).${n > NOTE_CHARS ? ' This is too long.' : ''}`
+    : `${n} characters`;
   const saved = store.get('vars', {});
   const cur = {}; document.querySelectorAll('[data-var]').forEach(i => cur[i.dataset.var] = i.value);
   $('w-vars').innerHTML = senderVars().map(n => `<div><label>{sender_${esc(n)}}</label>
@@ -436,8 +461,10 @@ function updateAudience() {
   if (f.exclude_tag) parts.push(`not in group ${f.exclude_tag}`);
   if (f.since) parts.push(`connected since ${f.since}`);
   if (f.limit) parts.push(`at most ${f.limit} people`);
-  $('audience-note').innerHTML = 'Audience: ' + (parts.length ? esc(parts.join('; ')) : '<b>all your connections</b>') +
-    ' - change this on the <a href="#" onclick="openTab(\'contacts\');return false">Contacts</a> tab.';
+  const who = f.prospects ? 'people you added who aren\'t connections yet' : 'all your connections';
+  const how = f.prospects ? ` They get a connection request with this message as its note, so keep it under ${NOTE_CHARS} characters.` : '';
+  $('audience-note').innerHTML = 'Audience: ' + (parts.length && !f.prospects ? esc(parts.join('; ')) : `<b>${who}</b>` + (parts.length ? ', ' + esc(parts.join('; ')) : '')) +
+    ' - change this on the <a href="#" onclick="openTab(\'contacts\');return false">Contacts</a> tab.' + how;
 }
 $('btn-preview').onclick = () => guard($('btn-preview'), async () => {
   hide('write-msg');
@@ -490,7 +517,7 @@ async function loadMessages(more) {
     return `<div class="mcard" data-id="${m.id}" data-contact="${m.contact_id}">
       <div class="mhead"><span class="who">${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.first_name)} ${esc(m.last_name)}</a>` : esc(m.first_name + ' ' + m.last_name)}</span>
         <span class="sub">${esc([m.position, m.company].filter(Boolean).join(' @ '))}</span>
-        <span class="badge b-${m.status}">${m.status === 'draft' ? 'waiting' : m.status}</span>${m.ai_at ? '<span class="badge b-draft" title="Rewritten by Claude from their profile">personalized</span>' : ''}</div>
+        <span class="badge b-${m.status}">${m.status === 'draft' ? 'waiting' : m.status}</span>${m.ai_at ? '<span class="badge b-draft" title="Rewritten by Claude from their profile">personalized</span>' : ''}${m.prospect ? `<span class="badge b-draft" title="Goes out as the note on a connection request">connection note, ${m.body.length}/${NOTE_CHARS}</span>` : ''}</div>
       ${m.thread ? `<details class="thread"><summary>Earlier conversation with ${esc(m.first_name)}</summary><pre>${esc(m.thread)}</pre></details>` : ''}
       ${draft ? `<textarea>${esc(m.body)}</textarea>` : `<pre>${esc(m.body)}</pre>`}
       ${m.error ? `<div class="err-note">${esc(m.error)}</div>` : ''}
@@ -533,7 +560,8 @@ $('btn-login').onclick = (e) => { e.preventDefault(); guard($('btn-login'), asyn
 function sendBody(dry) {
   return { campaign: $('s-campaign').value, daily_cap: $('s-cap').value, max: dry ? 3 : $('s-max').value,
            min_delay: dry ? 0 : $('s-min').value, max_delay: dry ? 0 : $('s-maxd').value,
-           headless: $('s-headless').checked, personalize: $('s-personalize').checked, dry_run: dry };
+           headless: $('s-headless').checked, personalize: $('s-personalize').checked,
+           without_note: $('s-nonote').checked, dry_run: dry };
 }
 $('btn-test').onclick = () => guard($('btn-test'), async () => { hide('send-msg'); await api('autosend', sendBody(true)); startPolling(); }, 'send-msg');
 $('btn-send').onclick = () => guard($('btn-send'), async () => {
@@ -555,18 +583,21 @@ function renderJob() {
            log.textContent = (j.log || '...').replace(/Failed messages are marked[^\n]*/,
              'Failed messages are on the Review tab (Show: Failed), where you can put them back in the queue.'); if (atEnd) log.scrollTop = log.scrollHeight; }
   const importing = j && j.kind === 'LinkedIn import', personalizing = j && j.kind === 'personalizing', tagging = j && j.kind === 'tagging';
-  for (const [flag, logId] of [[importing, 'import-log'], [personalizing, 'personalize-log'], [tagging, 'tag-log']]) {
+  const adding = j && j.kind === 'adding people';
+  $('prospects-count').textContent = state.prospects ? `${state.prospects} added so far` : '';
+  $('btn-prospects-stop').style.display = running && adding ? '' : 'none';
+  for (const [flag, logId] of [[importing, 'import-log'], [personalizing, 'personalize-log'], [tagging, 'tag-log'], [adding, 'prospects-log']]) {
     $(logId).style.display = flag ? '' : 'none';
     if (flag) { $(logId).textContent = j.log || '...'; $(logId).scrollTop = $(logId).scrollHeight; }
   }
-  $('btn-stop').style.display = running && !importing && !personalizing && !tagging ? '' : 'none';
+  $('btn-stop').style.display = running && !importing && !personalizing && !tagging && !adding ? '' : 'none';
   $('btn-import-li-stop').style.display = running && importing ? '' : 'none';
   $('btn-tag-stop').style.display = running && tagging ? '' : 'none';
   $('btn-personalize-stop').style.display = running && personalizing ? '' : 'none';
-  ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize', 'btn-replies', 'btn-tag'].forEach(id => $(id).disabled = !!running);
+  ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize', 'btn-replies', 'btn-tag', 'btn-prospects'].forEach(id => $(id).disabled = !!running);
   $('ai-status').textContent = $('tag-ai-status').textContent = state.ai ? `Using ${state.ai}.` : 'Claude isn\'t reachable yet: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.';
   if (!running && polling) { clearInterval(polling); polling = null;
-    if (store.get('tab') === 'review') loadMessages(); if (importing || tagging) search().catch(() => {}); }
+    if (store.get('tab') === 'review') loadMessages(); if (importing || tagging || adding) search().catch(() => {}); }
 }
 function startPolling() { if (!polling) polling = setInterval(() => refresh().catch(() => {}), 1500); refresh(); }
 
