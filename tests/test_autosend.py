@@ -4,6 +4,7 @@ Runs a real headless browser; skipped when Playwright isn't installed. Set
 OUTREACH_BROWSER_PATH if Playwright's bundled Chromium isn't installed.
 """
 
+import datetime as dt
 import json
 import re
 import socket
@@ -120,7 +121,8 @@ function more() {{
 CONNECT_IN_PLACE = ('<a aria-label="Invite {name} to connect" href="/{slug}" hidden>Connect</a>'
                     '<a aria-label="Invite {name} to connect" href="/{slug}" onclick="return invite()">Connect</a>'
                     + IN_PLACE + DECOY)
-CONNECT_IN_MENU = '<button>Follow</button><button aria-label="More" onclick="more()"></button>' + IN_PLACE + DECOY
+CONNECT_IN_MENU = ('<button>Follow</button><button aria-label="More" hidden></button>'
+                   '<button aria-label="More" onclick="more()"></button>' + IN_PLACE + DECOY)
 
 # The invite page: "Add a note" reveals the note box, its counter and how many notes are left.
 INVITE_PAGE = """<!doctype html><html><body><main>
@@ -170,8 +172,6 @@ PAGES = {
     "p3": dict(name="Rae Prospect", degree="2nd", button=CONNECT_IN_PLACE, stuck="false", thread=""),
     "p4": dict(name="Sy Prospect", degree="2nd", button=CONNECT_IN_MENU, stuck="false", thread=""),
     "nonotes": dict(name="Nat Nonotes", degree="2nd", button=CONNECT, stuck="false", thread=""),
-    "pending": dict(name="Pat Prospect", degree="2nd", button="<span></span><button disabled>Pending</button>",
-                    stuck="false", thread=""),
     "flaky": dict(name="Flo Flaky", degree="1st", button=LINK, stuck="false", thread=""),
     "slow": dict(name="Sol Slow", degree="1st", button=LINK, stuck="false", thread="", composer=SLOW_COMPOSER),
     "enter": dict(name="Eve Enter", degree="1st", button=LINK, stuck="false", thread="", composer=ENTER_COMPOSER),
@@ -187,9 +187,16 @@ def profile_html(slug):
     return PROFILE.format(**p)
 
 
+# The connections list, newest first: where an accepted invitation shows up.
+CONNECTIONS_PAGE = """<!doctype html><html><body><main><h1>Connections</h1><ul>{cards}</ul></main></body></html>"""
+CONNECTION_CARD = ('<li><a href="/in/{0}/"><span>{1}</span></a><p>Engineer at Somewhere</p>'
+                   '<time>Connected on {2}</time><button>Message</button></li>')
+
+
 class Handler(BaseHTTPRequestHandler):
     sent = []
     visits = {}
+    connections = []  # (slug, name, "Month D, YYYY")
 
     def log_message(self, *a):
         pass
@@ -215,6 +222,8 @@ class Handler(BaseHTTPRequestHandler):
                 slug = q["recipient"]
                 tpl = PAGES[slug].get("composer", COMPOSER)
                 html = COMPOSE_PAGE.format(composer=tpl.format(hidden="", slug=slug, **PAGES[slug]))
+        elif self.path.startswith("/mynetwork/"):
+            html = CONNECTIONS_PAGE.format(cards="".join(CONNECTION_CARD.format(*c) for c in Handler.connections))
         elif slug == "restricted":
             html = "<html><body><main>We've detected unusual activity on your account.</main></body></html>"
         elif slug in PAGES:
@@ -279,8 +288,13 @@ class AutosendTest(unittest.TestCase):
     def setUp(self):
         Handler.sent.clear()
         Handler.visits.clear()
+        Handler.connections = []
         self.tmp = tempfile.TemporaryDirectory()
         self.dbpath = str(Path(self.tmp.name) / "t.db")
+        read = lb.collect_connections  # the mock list has no pager and nothing to wait for
+        lb.collect_connections = lambda page, **kw: read(page, **{**kw, "pause": (0, 0.1), "stall_s": 3,
+                                                                   "pager_timeout_s": 1})
+        self.addCleanup(setattr, lb, "collect_connections", read)
         outreach.main(["--db", self.dbpath, "import", str(HERE / "sample_connections.csv")])
         outreach.main(["--db", self.dbpath, "draft", "c", "--template", str(HERE / "templates/product-beta.txt"),
                        "--sender-name", "Sam", "--var", "product=P", "--var", "audience=A", "--var", "problem=Q"])
@@ -385,14 +399,18 @@ class AutosendTest(unittest.TestCase):
         self.assertEqual(state(), ("draft", 2, 1))  # invited; the message is still waiting
         self.assertEqual(outreach.invites_last_24h(db), 1)
 
-        db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + "pending", ids[0]))
-        db.commit()
-        self.autosend(db, "--without-note")  # not accepted yet: nothing more happens, and no second invitation
+        # Nobody new on the connections list: nothing more happens, no second invitation,
+        # and their profile isn't opened again.
+        Handler.connections = [("ok2", "Raj Patel", "January 15, 2024")]
+        self.autosend(db, "--without-note")
+        self.assertEqual(Handler.visits, {"p1": 1})
         self.assertEqual(len(Handler.sent), 1)
         self.assertEqual(state(), ("draft", 2, 1))
 
-        db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + "ok1", ids[0]))  # now a 1st-degree profile
+        # They accept: a 1st-degree profile now, and the newest name on the connections list.
+        db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + "ok1", ids[0]))
         db.commit()
+        Handler.connections.insert(0, ("ok1", "Jane Doe", dt.date.today().strftime("%B %d, %Y")))
         self.autosend(db)
         self.assertEqual(Handler.sent[1:], [{"who": "ok1", "text": self.NOTE}])  # the message, as a message
         self.assertEqual(state(), ("sent", 0, 1))

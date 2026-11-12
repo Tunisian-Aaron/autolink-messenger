@@ -367,23 +367,17 @@ class LinkedInSender:
             if not opened_more:  # some profiles keep Connect behind "More"
                 opened_more = True
                 with contextlib.suppress(Exception):
-                    more = self.page.locator("main").get_by_role("button", name=re.compile(r"^more( actions)?$", re.I))
-                    if more.count() and more.first.is_visible():
-                        more.first.click(timeout=2000)
+                    more = self.page.locator("main button[aria-label]")  # the first one showing: a hidden twin can precede it
+                    for i in range(min(more.count(), 40)):
+                        if re.match(r"more( actions)?$", more.nth(i).get_attribute("aria-label") or "", re.I) \
+                                and more.nth(i).is_visible():
+                            more.nth(i).click(timeout=2000)
+                            break
             time.sleep(0.25)
         top = main_lines(self.page)[:30]
         if "Pending" in top:
             raise InvitePending("your invitation to them is already pending")
         raise SendError("couldn't find their Connect button (they may only allow followers)")
-
-    def connection_state(self, profile_url: str) -> str:
-        """'connected' (1st degree), 'pending' (your invitation awaits their answer) or 'open'."""
-        self.page.goto(profile_url, wait_until="domcontentloaded")
-        self.check_blocked()
-        lines = _wait_for_text(self.page, lambda ls: bool(top_card(ls)["degree"]), self.timeout_s)
-        if "1st" in top_card(lines)["degree"]:
-            return "connected"
-        return "pending" if "Pending" in lines[:30] else "open"
 
     def open_invite(self, profile_url: str, note: bool = True) -> dict:
         """Open the connection request for this person, up to the note box, without sending.
@@ -695,6 +689,11 @@ def feed_url_for(url: str) -> str:
     return urlparse(url)._replace(path="/feed/", query="", fragment="").geturl()
 
 
+def connections_url_for(url: str) -> str:
+    """The connections list on the same site as url."""
+    return urlparse(url)._replace(path=urlparse(CONNECTIONS_URL).path, query="", fragment="").geturl()
+
+
 # Returns [{url, name, lines}] for every person on the page not already in `seen`,
 # keyed by their /in/ URL, and scrolls to the bottom so LinkedIn loads the next batch.
 _CARDS_JS = r"""([sel, seen]) => {
@@ -817,7 +816,7 @@ def fetch_pager(page, template: dict, start: int):
 
 def collect_connections(page, url: str = CONNECTIONS_URL, max_contacts: int | None = None,
                         pause=(1.0, 2.0), sleep=time.sleep, should_stop=lambda: False, on_batch=lambda batch: None,
-                        stall_s: float = 90, pager_timeout_s: float = 12):
+                        stall_s: float = 90, pager_timeout_s: float = 12, say=print):
     """Read your connections list, calling on_batch(list of person dicts) as each new
     batch arrives, and returning everyone found.
 
@@ -854,7 +853,7 @@ def collect_connections(page, url: str = CONNECTIONS_URL, max_contacts: int | No
 
     template = capture_pager(page, pager_timeout_s)
     if template:
-        print(f"Reading{of} connections, 10 per request...")
+        say(f"Reading{of} connections, 10 per request...")
         origin = urlparse(url)._replace(path="", query="", fragment="").geturl()
         start, retries, since_print = 0, 0, 0
         while not should_stop() and not done():
@@ -863,11 +862,11 @@ def collect_connections(page, url: str = CONNECTIONS_URL, max_contacts: int | No
                 raise StopRun(f"LinkedIn redirected to {final_url} - log in again and complete any verification.")
             if status in (429, 500, 502, 503, 504) and retries < 3:
                 retries += 1
-                print(f"  LinkedIn answered {status}; waiting a minute before trying again ({retries}/3)...")
+                say(f"  LinkedIn answered {status}; waiting a minute before trying again ({retries}/3)...")
                 sleep(60)
                 continue
             if status != 200:
-                print(f"  LinkedIn answered {status} at {len(found)}{of}; stopping here. Run again later to continue.")
+                say(f"  LinkedIn answered {status} at {len(found)}{of}; stopping here. Run again later to continue.")
                 break
             retries = 0
             people = parse_pager_response(text, origin)
@@ -878,14 +877,14 @@ def collect_connections(page, url: str = CONNECTIONS_URL, max_contacts: int | No
             since_print += 1
             if since_print >= 5 or done():
                 since_print = 0
-                print(f"  {len(found)}{of} connections so far...")
+                say(f"  {len(found)}{of} connections so far...")
             sleep(random.uniform(*pause))
         if not found:
             raise SendError("the connections pager returned nobody - LinkedIn's response format may have changed "
                             "(see PAGER_* at the top of linkedin_browser.py)")
         return list(found.values())
 
-    print(f"Reading{of} connections by scrolling the page (the pager request wasn't seen)...")
+    say(f"Reading{of} connections by scrolling the page (the pager request wasn't seen)...")
     last_new = time.monotonic()
     while time.monotonic() - last_new < stall_s and not should_stop():
         before = len(found)
@@ -897,7 +896,7 @@ def collect_connections(page, url: str = CONNECTIONS_URL, max_contacts: int | No
             continue
         if take([c for c in map(parse_card, cards) if c]):
             last_new = time.monotonic()
-            print(f"  {len(found)}{of} connections so far...")
+            say(f"  {len(found)}{of} connections so far...")
         if done():
             break
         with contextlib.suppress(Exception):

@@ -322,8 +322,9 @@ What to know:
 - **Out of notes? Connect first, message after.** `autosend intros
   --without-note` sends the requests with no note and keeps each message
   queued. Later runs check who accepted and send those people their message as
-  a normal message, which has no 200-character limit. People who haven't
-  answered are left alone, and nobody is invited twice.
+  a normal message, which has no 200-character limit. The check is one look at
+  the top of your connections list, not a visit to every profile. People who
+  haven't answered are left alone, and nobody is invited twice.
 - **Requests have their own cap**, `--invite-cap` (15 per 24 hours by default),
   on top of the daily cap. LinkedIn allows roughly 100 requests a week.
 - **Only their own Connect button is used.** A profile's sidebar suggests other

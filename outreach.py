@@ -37,7 +37,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 def load_env_file(path: Path = Path(__file__).resolve().parent / ".env"):
     """Read KEY=VALUE lines from a .env next to this file (gitignored), without overriding
@@ -62,6 +62,7 @@ LINKEDIN_MAX_CHARS = 8000
 NOTE_CHARS = 200          # a connection request's note on a free account (LinkedIn's box says the real limit)
 NOTE_CHARS_PREMIUM = 300
 DEFAULT_INVITE_CAP = 15   # connection requests per rolling 24h; LinkedIn allows roughly 100 a week
+ACCEPT_LOOKBACK = 100  # how many of your newest connections to look through for people who accepted
 AI_MODEL = "claude-opus-5-5"
 
 SCHEMA = """
@@ -1380,6 +1381,32 @@ def cmd_login(db, args):
     lb.interactive_login(args.profile_dir, channel=args.channel, cancelled=stop.is_set)
 
 
+def accepted_invitations(page, pending, sleep=time.sleep, stopping=lambda: False) -> list:
+    """Those of `pending` (messages to people invited without a note) who are now among your newest
+    connections. One read of the top of your connections list, instead of opening every profile:
+    it stops once everyone is found, or the list reaches people who connected before the first
+    invitation went out."""
+    import linkedin_browser as lb
+
+    def slug(url):
+        return unquote((url or "").rstrip("/").rsplit("/", 1)[-1]).lower()
+
+    waiting = {slug(m["url"]): m for m in pending}
+    first_invite = min((m["invited_at"] or "")[:10] for m in pending)
+    seen, older = set(), []
+
+    def look(people):
+        for c in people:
+            seen.add(slug(c["url"]))
+            if (parse_date(c["connected_on"]) or first_invite) < first_invite:
+                older.append(c)
+
+    lb.collect_connections(page, url=lb.connections_url_for(pending[0]["url"]), max_contacts=ACCEPT_LOOKBACK,
+                           sleep=sleep, on_batch=look, say=lambda *a: None,
+                           should_stop=lambda: stopping() or bool(older) or waiting.keys() <= seen)
+    return [m for s, m in waiting.items() if s in seen]
+
+
 def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, cancelled=lambda: False, ai=None):
     import linkedin_browser as lb
     if args.min_delay > args.max_delay:
@@ -1404,10 +1431,13 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
     # Those count toward the daily cap and have a tighter one of their own.
     size = min(len(queue) if args.dry_run else max(room, 0), args.max or len(queue))
     invite_room = len(queue) if args.dry_run else args.invite_cap - invites_last_24h(db)
+    pending = [m for m in queue if m["prospect"] == 2]  # invited without a note; their message waits
     batch, capped = [], 0
     for m in queue:
         if len(batch) >= size:
             break
+        if m["prospect"] == 2:
+            continue
         if m["prospect"] == 1:
             if invite_room <= 0:
                 capped += 1
@@ -1416,7 +1446,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
         batch.append(m)
     if capped:
         print(f"{capped} connection request(s) wait for later: the cap of {args.invite_cap} per 24h is reached.")
-    if not batch:
+    if not batch and not pending:
         return
     avg = (args.min_delay + args.max_delay) / 2
     invites = sum(1 for m in batch if m["prospect"] == 1)
@@ -1426,6 +1456,9 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
           f"(cap {args.daily_cap}/24h, {sent_last_24h(db)} already sent). "
           f"Pacing {args.min_delay:.0f}-{args.max_delay:.0f}s between messages, "
           f"about {len(batch) * avg / 60:.0f} min total.")
+    if pending:
+        print(f"{len(pending)} invitation(s) await an answer: your newest connections show who accepted, "
+              "and those people get their message.")
     if not args.dry_run and not args.yes:
         if prompt("Type 'send' to start sending from your LinkedIn account: ").strip().lower() != "send":
             print("Aborted.")
@@ -1450,10 +1483,25 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
 
     with sender_factory() as page:
         sender = lb.LinkedInSender(page)
-        first_url = next((m["url"] for m in batch if m["url"]), None)
+        first_url = next((m["url"] for m in batch + pending if m["url"]), None)
         if first_url:  # logged out? wait for you to log in before touching the queue
             lb.ensure_logged_in(page, lb.feed_url_for(first_url), cancelled=stopping)
-        todo = list(batch)  # grows: a send that fails before anything went out gets one more try at the end
+        accepted = []
+        if pending:
+            try:
+                accepted = accepted_invitations(page, pending, sleep, stopping)
+            except lb.StopRun as e:
+                print(f"STOPPED: {e}")
+                batch = []
+            except Exception as e:
+                print(f"  ! couldn't check who accepted ({type(e).__name__}: {str(e).splitlines()[0]})")
+            for m in accepted:
+                print(f"  {m['first_name']} {m['last_name']} accepted your invitation")
+                if not args.dry_run:
+                    db.execute("UPDATE contacts SET prospect=0 WHERE id=?", (m["contact_id"],))
+            db.commit()
+        # grows: a send that fails before anything went out gets one more try at the end
+        todo = (accepted + batch)[:max(size, 0)]
         for i, m in enumerate(todo):
             if i:
                 delay = random.uniform(args.min_delay, args.max_delay)
@@ -1469,23 +1517,6 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
             invite = m["prospect"] == 1
             blank = invite and getattr(args, "without_note", False)  # the message waits until they accept
             rewrite = ai is not None and not m["ai_at"] and not blank
-            if m["prospect"] == 2:  # invited without a note earlier: have they accepted?
-                try:
-                    state = sender.connection_state(m["url"])
-                except lb.StopRun as e:
-                    print(f"STOPPED: {e}")
-                    break
-                except Exception as e:
-                    print(f"  ! {who}: couldn't check whether they accepted ({type(e).__name__})")
-                    continue
-                if state != "connected":
-                    print(f"  - {who}: " + ("still waiting for them to accept" if state == "pending" else
-                                            "your invitation is no longer pending; their message stays unsent"))
-                    continue
-                print(f"  {who} accepted your invitation")
-                if not args.dry_run:
-                    db.execute("UPDATE contacts SET prospect=0 WHERE id=?", (m["contact_id"],))
-                    db.commit()
             if rewrite:
                 try:  # their profile first: reading it leaves the page, so before the conversation opens
                     ensure_profile(db, m, page, sleep)
