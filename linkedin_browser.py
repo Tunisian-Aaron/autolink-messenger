@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import unicodedata
 import sys
 import time
 from pathlib import Path
@@ -74,21 +75,54 @@ CANCEL_NOTE = [("role", "button", r"^cancel adding a note$"), ("role", "button",
 NOTE_COUNTER = re.compile(r"\b\d{1,4}\s*/\s*(\d{2,4})\b")  # "0/200": the second number is the limit
 NOTES_LEFT = re.compile(r"(\d+) personalized invitations? remaining", re.I)
 NOTE_FALLBACK_LIMIT = 200
+# The conversation a message box belongs to: the pane on the messaging pages (a thread, or a
+# new message with the recipient's name in it), or a chat bubble popped up at the bottom of the
+# page. A bubble can pop up for SOMEONE ELSE at any moment, when a reply arrives (seen
+# 2026-11-14: a reply meant for one person went into another's bubble), so a box is only used
+# once its own conversation names the person, and the thread is read from that conversation only.
+CONVERSATION = ".msg-convo-wrapper, .msg-overlay-conversation-bubble"
+POPUPS = "#msg-overlay"
+# The conversation's own text minus its messages and the box: its header, i.e. who it is with.
+CONVERSATION_HEADER_JS = """box => {
+  const pane = box.closest('%s');
+  if (!pane) return null;
+  const c = pane.cloneNode(true);
+  c.querySelectorAll('form, [contenteditable], [class*="msg-s-message-list"], [class*="msg-s-event-listitem"]')
+    .forEach(e => e.remove());
+  return c.textContent.replace(/\\s+/g, ' ');
+}""" % CONVERSATION
 # The conversation above the composer: a date heading per day, then one list item per message,
-# the sender's name only on the first of a run of messages from the same person.
-THREAD_JS = """() => {
+# the sender's name only on the first of a run of messages from the same person (else read from
+# the screen-reader line "Jane Doe sent the following message at 8:23 AM").
+THREAD_JS = """box => {
   const out = [];
   let who = '', day = '';
-  for (const item of document.querySelectorAll('[class*="message-list__time-heading"], .msg-s-event-listitem, [class*="msg-s-event-listitem"]')) {
+  const root = (box && box.closest('%s')) || document;
+  for (const item of root.querySelectorAll('[class*="message-list__time-heading"], .msg-s-event-listitem, [class*="msg-s-event-listitem"]')) {
+    if (root === document && item.closest('%s')) continue;  // someone else's pop-up chat
     if (/time-heading/.test(item.className)) { day = item.innerText.trim(); continue; }
     const name = item.querySelector('.msg-s-message-group__name, [class*="message-group__name"]');
     if (name && name.innerText.trim()) who = name.innerText.trim();
+    else {
+      const said = ((item.closest('li') || item).textContent || '').trim().match(/^(.+?) sent the following messages? at /);
+      if (said) who = said[1].trim();
+    }
     const body = item.querySelector('.msg-s-event-listitem__body, [class*="event-listitem__body"]');
     const text = body ? body.innerText.trim() : '';
     if (text && !out.some(m => m.who === who && m.text === text)) out.push({who, text, day});
   }
   return out;
-}"""
+}""" % (CONVERSATION, POPUPS)
+
+
+def _fold(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c)).casefold()
+
+
+def names(text: str, name: str) -> bool:
+    """Whether `text` mentions the person `name` by first name, ignoring case and accents."""
+    words = _fold(name).split()
+    return bool(words) and re.search(r"(?<!\w)" + re.escape(words[0]) + r"(?!\w)", _fold(text)) is not None
 
 # Connections list (import-linkedin). The page loads 10 people at a time through a
 # "pager" request whose body is fixed apart from startIndex, so once we've seen the page
@@ -182,6 +216,7 @@ class LinkedInSender:
         self.page = page
         self.timeout_s = timeout_s
         self.confirm_timeout_s = confirm_timeout_s
+        self._box = None  # the open conversation's message box (an element handle)
 
     # -- helpers -------------------------------------------------------------
     def _locators(self, specs):
@@ -243,14 +278,16 @@ class LinkedInSender:
                 raise StopRun(f"LinkedIn is showing a '{phrase}' notice - stopping. Check your "
                               "account in the browser before sending more.")
 
-    def send(self, profile_url: str, body: str, dry_run: bool = False):
-        self.open(profile_url)
+    def send(self, profile_url: str, body: str, dry_run: bool = False, name: str = ""):
+        self.open(profile_url, name=name)
         self.send_text(body, dry_run=dry_run)
 
-    def open(self, profile_url: str) -> list[dict]:
+    def open(self, profile_url: str, name: str = "") -> list[dict]:
         """Open the conversation with this person from their profile. Returns the messages
         already in it, oldest first, as {"who": sender name, "text": ..., "day": LinkedIn's date
-        heading, e.g. "OCT 6" or "TODAY"} (empty when the thread is new or the page shows none)."""
+        heading, e.g. "OCT 6" or "TODAY"} (empty when the thread is new or the page shows none).
+        With their `name`, only a message box whose conversation names them is used."""
+        self._box = None
         if not profile_url:
             raise NotReachable("contact has no profile URL")
         self.page.goto(profile_url, wait_until="domcontentloaded")
@@ -266,8 +303,31 @@ class LinkedInSender:
             self.check_blocked()
         else:
             btn.click()
-        self._box = self._first_visible(COMPOSER, "message box")
+        self._box = self._conversation_box(name)
         return self.thread()
+
+    def _conversation_box(self, name: str):
+        """The visible message box of the conversation with `name` (any visible box without a
+        name), held as a handle so a chat popping up later can't take its place."""
+        deadline = time.monotonic() + self.timeout_s
+        other = False
+        while time.monotonic() < deadline:
+            for loc in self._locators(COMPOSER):
+                for i in range(min(loc.count(), 5)):
+                    with contextlib.suppress(Exception):
+                        box = loc.nth(i).element_handle(timeout=1000)
+                        if not box.is_visible():
+                            continue
+                        if not name:
+                            return box
+                        header = box.evaluate(CONVERSATION_HEADER_JS)
+                        if header is not None and names(header, name):
+                            return box
+                        other = True
+            time.sleep(0.25)
+        if other:
+            raise SendError(f"the open message box isn't in the conversation with {name}")
+        raise SendError("couldn't find the message box")
 
     def thread(self, settle_s: float = 2.0) -> list[dict]:
         """Earlier messages in the open conversation. Waits briefly for them to render."""
@@ -275,7 +335,7 @@ class LinkedInSender:
         found = []
         while True:
             with contextlib.suppress(Exception):
-                found = self.page.evaluate(THREAD_JS) or []
+                found = (self._box.evaluate(THREAD_JS) if self._box else self.page.evaluate(THREAD_JS, None)) or []
             if found or time.monotonic() >= deadline:
                 return found
             time.sleep(0.25)
@@ -292,6 +352,12 @@ class LinkedInSender:
                 self.page.keyboard.press("Shift+Enter")
             if line:
                 self.page.keyboard.insert_text(line)
+        snippet = " ".join(max(body.split("\n"), key=len).split())[:60]
+        if snippet not in " ".join(box.inner_text().split()):  # the text went somewhere else
+            with contextlib.suppress(Exception):
+                box.click()
+                self._clear_focused()
+            raise SendError("the message didn't land in the conversation's box; nothing was sent")
 
         if dry_run:
             self._clear_focused()
@@ -321,7 +387,6 @@ class LinkedInSender:
 
         # LinkedIn empties the composer once the message is accepted. When it's slow (a "Sending..."
         # spinner that lingers), the message showing up in the conversation proves it too.
-        snippet = " ".join(max(body.split("\n"), key=len).split())[:60]
         deadline = time.monotonic() + self.confirm_timeout_s
         while time.monotonic() < deadline:
             if not box.inner_text().strip() or self._in_thread(snippet):
@@ -486,8 +551,7 @@ class LinkedInSender:
 
     def _in_thread(self, snippet: str) -> bool:
         with contextlib.suppress(Exception):
-            return bool(snippet) and any(snippet in " ".join(m["text"].split())
-                                         for m in self.page.evaluate(THREAD_JS))
+            return bool(snippet) and any(snippet in " ".join(m["text"].split()) for m in self.thread(0))
         return False
 
     def screenshot(self, path: str):

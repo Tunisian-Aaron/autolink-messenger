@@ -32,14 +32,14 @@ INBOX = """<!doctype html><html><head><meta charset="utf-8"></head><body><main>
 # Jane's profile and her conversation: her reply is two messages, longer than the inbox preview.
 PROFILE = """<!doctype html><html><body><main><div><h1>Jane Doe</h1><span>· 1st</span></div>
 <a href="/messaging/compose/?recipient=jane">Message</a></main></body></html>"""
-CONVO = """<!doctype html><html><body><main><h2>New message</h2>
+CONVO = """<!doctype html><html><body><main><div class="msg-convo-wrapper"><h2>Jane Doe</h2>
 <div class="msg-s-event-listitem"><span class="msg-s-message-group__name">Sam Sender</span>
   <p class="msg-s-event-listitem__body">Hi Jane, try it when you can.</p></div>
 <div class="msg-s-event-listitem"><span class="msg-s-message-group__name">Jane Doe</span>
   <p class="msg-s-event-listitem__body">Thanks, will try it this weekend!</p></div>
 <div class="msg-s-event-listitem"><p class="msg-s-event-listitem__body">One thing: the map is slow.</p></div>
 <div class="msg-form__contenteditable" contenteditable="true" role="textbox" aria-label="Write a message…"></div>
-</main></body></html>"""
+</div></main></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):

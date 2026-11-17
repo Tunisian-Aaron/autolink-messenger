@@ -182,6 +182,11 @@ rewrite also sees when each message was sent and today's date, so a dinner
 proposed in March isn't mistaken for a plan this week. The earlier conversation
 is kept with the message, so the Review tab shows it above what was sent.
 
+Reading a profile's About, Experience and Education takes three extra page
+loads per person. To keep LinkedIn traffic low, `autosend --personalize
+--no-profile-read` rewrites from what is already stored (headline, company,
+title) plus the conversation, so each person costs one page load.
+
 ```bash
 python outreach.py personalize beta-oct --enrich \
   --brief "Get honest product feedback on Acme from founders, and open the door to a call"
@@ -253,6 +258,8 @@ time with Ctrl-C, and the next run picks up where it left off.
 | Login wall, security check, "unusual activity" or restriction notice | Stops the whole run and saves a screenshot |
 | Not a 1st-degree connection | That message is marked `failed`; the run continues (to reach them, see *Connecting with new people*) |
 | Page didn't load properly, no Message button or message box | Nothing was sent, so that person gets one more try at the end of the run; a second failure is marked `failed` |
+| Someone else's chat pops up while the page loads | Ignored: the tool only reads and types in the conversation whose header names this person, checks the text landed in that box before sending, and sends nothing if it can't find it |
+| The same person was imported twice with differently encoded profile links (`%C3%A9` vs `é`) | Merged into one contact when the database opens, so nobody gets a message twice |
 | LinkedIn's "Press Enter to Send" setting is on | Handled: the tool presses Enter instead of clicking Send |
 | Clicked Send but couldn't confirm it went out | Confirmed from the conversation when LinkedIn is just slow; otherwise marked `failed`, never retried automatically, so nobody gets it twice |
 | LinkedIn loads slowly | Page loads are retried; after three timeouts the run stops cleanly |

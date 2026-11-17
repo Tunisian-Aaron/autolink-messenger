@@ -27,7 +27,8 @@ except ImportError:
     HAVE_PW = False
 
 # The composer, as on LinkedIn's /messaging/compose page and in the older overlay.
-COMPOSER = """<div id="overlay" {hidden}>
+COMPOSER = """<div id="overlay" class="msg-convo-wrapper" {hidden}>
+  <h2 class="msg-entity-lockup__entity-title">{name}</h2>
   {thread}
   <div class="msg-form__contenteditable" contenteditable="true" role="textbox"
        aria-label="Write a message…" style="min-height:40px;border:1px solid"></div>
@@ -81,6 +82,23 @@ PROFILE = """<!doctype html><html><body><main>
 {composer}</body></html>"""
 
 COMPOSE_PAGE = """<!doctype html><html><body><main><h2>New message</h2>{composer}</main></body></html>"""
+
+# Someone else's chat popping up at the bottom of the page (a reply just arrived), its message
+# without a sender name, while the person's own conversation is still loading.
+POPUP = """<aside id="msg-overlay"><div class="msg-overlay-conversation-bubble"><h2>Theo Other</h2>
+<ul class="msg-s-message-list-content"><li class="msg-s-message-list__event"><div class="msg-s-event-listitem">
+  <p class="msg-s-event-listitem__body">I looked at it as a family-vacation tool.</p></div></li></ul>
+<div class="msg-form__contenteditable" contenteditable="true" role="textbox" aria-label="Write a message…"
+     style="min-height:40px;border:1px solid"></div></div></aside>
+<script>
+document.querySelector('#msg-overlay [contenteditable]').addEventListener('keydown', e => {{
+  if (e.key === 'Enter' && !e.shiftKey)
+    fetch('/sent', {{method: 'POST', body: JSON.stringify({{who: 'WRONG PERSON', text: e.target.innerText}})}});
+}});
+const own = document.querySelector('main');
+own.hidden = true;
+if ({shows}) setTimeout(() => own.hidden = false, 1500);
+</script>"""
 
 # New layout: Message is a link to the compose page. Old layout: a button opening an overlay.
 LINK = '<a href="/messaging/compose/?recipient={slug}&interop=msgOverlay">Message</a>'
@@ -175,11 +193,18 @@ PAGES = {
     "flaky": dict(name="Flo Flaky", degree="1st", button=LINK, stuck="false", thread=""),
     "slow": dict(name="Sol Slow", degree="1st", button=LINK, stuck="false", thread="", composer=SLOW_COMPOSER),
     "enter": dict(name="Eve Enter", degree="1st", button=LINK, stuck="false", thread="", composer=ENTER_COMPOSER),
+    "popup": dict(name="Pia Popup", degree="1st", button=LINK, stuck="false", thread="", composer=ENTER_COMPOSER),
+    "popuponly": dict(name="Oz Only", degree="1st", button=LINK, stuck="false", thread="", composer=ENTER_COMPOSER),
 }
 
 
+def page_params(slug):
+    """A mock page's fields, with the name of the contact pointed at it (as LinkedIn shows it)."""
+    return dict(PAGES[slug], slug=slug, name=Handler.names.get(slug, PAGES[slug]["name"]))
+
+
 def profile_html(slug):
-    p = dict(PAGES[slug], slug=slug)
+    p = page_params(slug)
     p["button"] = p["button"].format(**p)
     tpl = p.pop("composer", COMPOSER)
     # the overlay composer only exists in the old (button) layout
@@ -197,6 +222,7 @@ class Handler(BaseHTTPRequestHandler):
     sent = []
     visits = {}
     connections = []  # (slug, name, "Month D, YYYY")
+    names = {}  # slug -> name of the contact pointed at that page
 
     def log_message(self, *a):
         pass
@@ -221,7 +247,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 slug = q["recipient"]
                 tpl = PAGES[slug].get("composer", COMPOSER)
-                html = COMPOSE_PAGE.format(composer=tpl.format(hidden="", slug=slug, **PAGES[slug]))
+                p = page_params(slug)
+                p.pop("composer", None)
+                html = COMPOSE_PAGE.format(composer=tpl.format(hidden="", **p))
+                if slug.startswith("popup"):
+                    html = html.replace("</body>", POPUP.format(shows=str(slug == "popup").lower()) + "</body>")
         elif self.path.startswith("/mynetwork/"):
             html = CONNECTIONS_PAGE.format(cards="".join(CONNECTION_CARD.format(*c) for c in Handler.connections))
         elif slug == "restricted":
@@ -289,6 +319,7 @@ class AutosendTest(unittest.TestCase):
         Handler.sent.clear()
         Handler.visits.clear()
         Handler.connections = []
+        Handler.names = {}
         self.tmp = tempfile.TemporaryDirectory()
         self.dbpath = str(Path(self.tmp.name) / "t.db")
         read = lb.collect_connections  # the mock list has no pager and nothing to wait for
@@ -308,6 +339,8 @@ class AutosendTest(unittest.TestCase):
         ids = [r["contact_id"] for r in outreach.campaign_messages(db, "c", "draft")]
         for cid, slug in zip(ids, slugs):
             db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + slug, cid))
+            c = db.execute("SELECT first_name, last_name FROM contacts WHERE id=?", (cid,)).fetchone()
+            Handler.names[slug] = f"{c['first_name']} {c['last_name']}"
         for cid in ids[len(slugs):]:
             db.execute("UPDATE contacts SET do_not_contact=1 WHERE id=?", (cid,))
         db.commit()
@@ -410,7 +443,9 @@ class AutosendTest(unittest.TestCase):
         # They accept: a 1st-degree profile now, and the newest name on the connections list.
         db.execute("UPDATE contacts SET url=? WHERE id=?", (self.base + "ok1", ids[0]))
         db.commit()
-        Handler.connections.insert(0, ("ok1", "Jane Doe", dt.date.today().strftime("%B %d, %Y")))
+        c = db.execute("SELECT first_name, last_name FROM contacts WHERE id=?", (ids[0],)).fetchone()
+        Handler.names["ok1"] = f"{c['first_name']} {c['last_name']}"
+        Handler.connections.insert(0, ("ok1", Handler.names["ok1"], dt.date.today().strftime("%B %d, %Y")))
         self.autosend(db)
         self.assertEqual(Handler.sent[1:], [{"who": "ok1", "text": self.NOTE}])  # the message, as a message
         self.assertEqual(state(), ("sent", 0, 1))
@@ -528,7 +563,7 @@ class AutosendTest(unittest.TestCase):
 
     def test_stops_when_the_network_is_down(self):
         # A refused connection raises the browser's net:: error, like a dropped internet connection.
-        db, ids = self.point_contacts(["ok1", "ok2", "ok1"])
+        db, ids = self.point_contacts(["ok1", "ok2", "enter"])
         with socket.socket() as sock:  # a port nothing listens on
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -585,6 +620,50 @@ class AutosendTest(unittest.TestCase):
         threads = {m["first_name"]: m["thread"] for m in outreach.campaign_messages(db, "c", "sent")}
         self.assertIn("Raj: Likewise!", threads.pop("Raj"))
         self.assertEqual(list(threads.values()), [None])
+
+    def test_personalize_without_reading_profiles(self):
+        class FakeClaude:
+            name = "fake"
+            prompts = []
+
+            def generate(self, prompt):
+                self.prompts.append(prompt)
+                if "Reply with exactly NONE" in prompt:
+                    return "NONE"
+                return "Hi %s,\n\nPersonal.\n\nSam" % re.search(r"Name: (\S+)", prompt).group(1)
+        db, ids = self.point_contacts(["ok1", "ok2"])
+        db.execute("UPDATE campaigns SET brief='Get feedback'")
+        db.commit()
+        ai = FakeClaude()
+        args = outreach.build_parser().parse_args(
+            ["--db", self.dbpath, "autosend", "c", "--headless", "--yes", "--min-delay", "0", "--max-delay", "0",
+             "--personalize", "--no-profile-read", "--profile-dir", str(Path(self.tmp.name) / "profile"),
+             "--screenshots", str(Path(self.tmp.name) / "shots")])
+        outreach.cmd_autosend(db, args, sleep=lambda s: None, ai=ai)
+        self.assertEqual(len(Handler.sent), 2)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0], 0)  # no details pages opened
+        self.assertFalse(any("Ten years in" in p for p in ai.prompts))
+        self.assertTrue(any("Raj: Likewise! Back on the 10th." in p for p in ai.prompts))  # still sees the conversation
+
+    def test_names_matches_first_names_loosely(self):
+        self.assertTrue(lb.names("New message Enter message recipients José Álvarez", "Jose Alvarez"))
+        self.assertTrue(lb.names("Sam Rivers ✨ Status is reachable", "Sam Rivers ✨"))
+        self.assertFalse(lb.names("Omar Haddad Status is reachable", "Lucia Bianchi"))
+        self.assertFalse(lb.names("Annabel Lee", "Ann Lee"))  # whole words only
+        self.assertFalse(lb.names("anything", ""))
+
+    def test_never_writes_in_someone_elses_popup(self):
+        # A reply from someone else pops up in a chat bubble while this person's conversation is
+        # still loading: their message isn't read as this conversation, and the text goes only
+        # into this person's own box. If their box never shows, nothing is sent at all.
+        db, ids = self.point_contacts(["popup", "popuponly"])
+        self.autosend(db)
+        self.assertEqual([s["who"] for s in Handler.sent], ["popup"])
+        st = self.statuses(db)
+        self.assertEqual((st[ids[0]], st[ids[1]]), ("sent", "failed"))
+        err = db.execute("SELECT error FROM messages WHERE contact_id=?", (ids[1],)).fetchone()[0]
+        self.assertIn("isn't in the conversation with", err)
+        self.assertIsNone(db.execute("SELECT thread FROM messages WHERE contact_id=?", (ids[0],)).fetchone()[0])
 
     def test_holds_someone_waiting_on_you(self):
         class FakeClaude:

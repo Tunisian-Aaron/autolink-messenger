@@ -37,6 +37,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import unquote
 from urllib.parse import unquote, urlparse
 
 def load_env_file(path: Path = Path(__file__).resolve().parent / ".env"):
@@ -132,7 +133,39 @@ def connect(path: str) -> sqlite3.Connection:
         db.execute("ALTER TABLE contacts ADD COLUMN tags TEXT")
     if "prospect" not in contact_cols:
         db.execute("ALTER TABLE contacts ADD COLUMN prospect INTEGER NOT NULL DEFAULT 0")
+    merge_duplicate_contacts(db)
     return db
+
+
+def contact_key(url: str, first: str = "", last: str = "") -> str:
+    """One key per person: their profile link, decoded (LinkedIn writes "élise" in one place and
+    "%C3%A9lise" in another), or their name when there's no link."""
+    return unquote(url or "").rstrip("/").lower() or f"name:{first} {last}".lower()
+
+
+def merge_duplicate_contacts(db):
+    """Folds contacts stored twice under differently encoded links into one, so nobody gets a
+    campaign's message twice. The row that was already messaged is kept; the other is marked
+    do-not-contact and loses its unsent drafts."""
+    groups = {}
+    for c in db.execute("SELECT id, key, do_not_contact FROM contacts WHERE key NOT LIKE 'merged:%'"):
+        groups.setdefault(contact_key(c["key"]) if not c["key"].startswith("name:") else c["key"], []).append(c)
+    for key, rows in groups.items():
+        if len(rows) < 2:
+            if rows[0]["key"] != key:  # stored before keys were decoded
+                db.execute("UPDATE contacts SET key=? WHERE id=?", (key, rows[0]["id"]))
+            continue
+        messaged = {r[0] for r in db.execute(
+            f"SELECT DISTINCT contact_id FROM messages WHERE status IN ('sent','replied') AND contact_id IN "
+            f"({','.join('?' * len(rows))})", [r["id"] for r in rows])}
+        keep = min(rows, key=lambda r: (r["id"] not in messaged, r["id"]))
+        for r in rows:
+            if r["id"] != keep["id"]:
+                db.execute("UPDATE contacts SET key=?, do_not_contact=1 WHERE id=?", (f"merged:{r['id']}", r["id"]))
+                db.execute("DELETE FROM messages WHERE contact_id=? AND status='draft'", (r["id"],))
+        db.execute("UPDATE contacts SET key=?, do_not_contact=? WHERE id=?",
+                   (key, max(r["do_not_contact"] for r in rows), keep["id"]))
+    db.commit()
 
 
 def stop_flag() -> threading.Event:
@@ -199,7 +232,7 @@ def save_contacts(db, rows, fill_blanks_only=False, prospect=False) -> tuple[int
         sets += ", prospect=0"
     added = updated = 0
     for r in rows:
-        key = r["url"].rstrip("/").lower() or f"name:{r['first_name']} {r['last_name']}".lower()
+        key = contact_key(r["url"], r["first_name"], r["last_name"])
         exists = db.execute("SELECT 1 FROM contacts WHERE key=?", (key,)).fetchone()
         db.execute(
             f"""INSERT INTO contacts (key, {", ".join(CONTACT_FIELDS)}, prospect) VALUES (?,?,?,?,?,?,?,?,?)
@@ -253,8 +286,8 @@ def cmd_add_prospects(db, args, page_factory=None, sleep=time.sleep):
     if not rows:
         raise SystemExit("No LinkedIn profile links found (they look like https://www.linkedin.com/in/someone).")
     known = {r["key"]: r for r in db.execute("SELECT key, prospect FROM contacts")}
-    new = [r for r in rows if r["url"].lower() not in known]
-    connected = [r for r in rows if r["url"].lower() in known and not known[r["url"].lower()]["prospect"]]
+    new = [r for r in rows if contact_key(r["url"]) not in known]
+    connected = [r for r in rows if contact_key(r["url"]) in known and not known[contact_key(r["url"])]["prospect"]]
     nameless = [r for r in new if not r["first_name"]]
     if nameless:  # only a link: read their name and headline from the profile
         if page_factory is None:
@@ -1173,7 +1206,7 @@ def cmd_replies(db, args, page_factory=None, inbox=None):
                 opened.append(m["id"])
                 try:
                     page.wait_for_timeout(random.uniform(2000, 5000) if len(opened) > 1 else 0)
-                    return their_last_words(sender.open(m["url"]), m)
+                    return their_last_words(sender.open(m["url"], name=f"{m['first_name']} {m['last_name']}"), m)
                 except lb.StopRun:
                     raise
                 except Exception:
@@ -1517,7 +1550,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
             invite = m["prospect"] == 1
             blank = invite and getattr(args, "without_note", False)  # the message waits until they accept
             rewrite = ai is not None and not m["ai_at"] and not blank
-            if rewrite:
+            if rewrite and not getattr(args, "no_profile_read", False):
                 try:  # their profile first: reading it leaves the page, so before the conversation opens
                     ensure_profile(db, m, page, sleep)
                 except lb.StopRun:
@@ -1532,7 +1565,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
                     if info["left"] is not None:
                         print(f"  LinkedIn says {info['left']} invitation note(s) remain this month")
                 else:
-                    thread = sender.open(m["url"])
+                    thread = sender.open(m["url"], name=who)
                 if thread:
                     print(f"  {len(thread)} earlier message(s) in the conversation with {who}")
                     if not rewrite and not args.dry_run:
@@ -1662,7 +1695,7 @@ def build_parser():
     s.add_argument("--brief", help="one-paragraph goal of the campaign (used by --ai)")
     s.add_argument("--sender-name", help="fills {sender_name}")
     s.add_argument("--var", action="append", default=[], metavar="KEY=VALUE",
-                   help="fills {sender_KEY}, e.g. --var product=Navoy (repeatable)")
+                   help="fills {sender_KEY}, e.g. --var product=Acme (repeatable)")
     s.add_argument("--ai", action="store_true", help="personalize each draft with Claude (needs ANTHROPIC_API_KEY)")
     s.add_argument("--cooldown-days", type=int, default=30,
                    help="skip anyone messaged in any campaign within N days (default 30)")
@@ -1766,6 +1799,9 @@ def build_parser():
                    help="open each profile and type the message, but don't press Send")
     s.add_argument("--personalize", action="store_true",
                    help="read each person's profile and have Claude rewrite their message right before sending")
+    s.add_argument("--no-profile-read", action="store_true",
+                   help="with --personalize: rewrite from what is already stored (headline, company, title) and the "
+                        "conversation, without opening the profile's details pages (three fewer page loads a person)")
     s.add_argument("--headless", action="store_true", help="hide the browser window")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt (for scheduled runs)")
     s.add_argument("--screenshots", default="failures", help="where to save failure screenshots")

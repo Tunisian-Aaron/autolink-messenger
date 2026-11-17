@@ -29,7 +29,7 @@ class OutreachTest(unittest.TestCase):
 
     def draft_product(self, *extra):
         self.run_cli("draft", "beta", "--template", str(TEMPLATE), "--sender-name", "Sam",
-                     "--var", "product=Navoy", "--var", "audience=founders",
+                     "--var", "product=Acme", "--var", "audience=founders",
                      "--var", "problem=AI search visibility", *extra)
 
     def test_import_skips_preamble_and_is_idempotent(self):
@@ -38,6 +38,30 @@ class OutreachTest(unittest.TestCase):
         self.assertEqual(len(rows), 5)
         self.assertEqual(rows[0]["first_name"], "Jane")
         self.assertEqual(rows[0]["connected_on"], "2024-01-15")
+
+    def test_one_contact_per_person_however_the_link_is_encoded(self):
+        db = self.db()
+        # an older database: the same person stored twice, the encoded twin already messaged
+        db.execute("INSERT INTO contacts (key, first_name, last_name, url) VALUES (?,?,?,?)",
+                   ("https://www.linkedin.com/in/%c3%a9lise-m", "Élise", "M", "https://www.linkedin.com/in/%C3%A9lise-m"))
+        db.execute("INSERT INTO contacts (key, first_name, last_name, url) VALUES (?,?,?,?)",
+                   ("https://www.linkedin.com/in/élise-m", "Élise", "M", "https://www.linkedin.com/in/élise-m"))
+        db.commit()
+        self.draft_product()
+        db = self.db()
+        twins = [r["id"] for r in db.execute("SELECT id FROM contacts WHERE first_name='Élise' ORDER BY id")]
+        db.execute("UPDATE messages SET status='sent' WHERE contact_id=?", (twins[0],))
+        db.commit()
+        db = self.db()  # opening the database folds the twins together
+        rows = db.execute("SELECT id, key, do_not_contact FROM contacts WHERE first_name='Élise' ORDER BY id").fetchall()
+        self.assertEqual([(r["key"], r["do_not_contact"]) for r in rows],
+                         [("https://www.linkedin.com/in/élise-m", 0), (f"merged:{twins[1]}", 1)])
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM messages WHERE contact_id=?", (twins[1],)).fetchone()[0], 0)
+        # importing the person again, under either spelling, updates the one contact
+        rows = [dict(first_name="Élise", last_name="M", url=u, email="", company="New Co", position="",
+                     connected_on="") for u in ("https://www.linkedin.com/in/%C3%A9lise-m/", "https://www.linkedin.com/in/élise-m")]
+        self.assertEqual(outreach.save_contacts(db, rows), (0, 2))
+        self.assertEqual(db.execute("SELECT company FROM contacts WHERE id=?", (twins[0],)).fetchone()[0], "New Co")
 
     def test_filters(self):
         args = outreach.build_parser().parse_args(
@@ -100,7 +124,7 @@ class OutreachTest(unittest.TestCase):
         bodies = db.execute("SELECT contact_id, body FROM messages").fetchall()
         self.assertEqual(sorted(r["contact_id"] for r in bodies), [1, 2, 4, 5])
         self.assertIn("Hi Jane", bodies[0]["body"])
-        self.assertIn("Navoy", bodies[0]["body"])
+        self.assertIn("Acme", bodies[0]["body"])
 
     def test_send_loop_cap_and_actions(self):
         self.draft_product()

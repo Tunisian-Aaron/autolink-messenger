@@ -73,10 +73,10 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("{sender_product}", r["error"])
 
     def test_preview_draft_and_edit(self):
-        status, r = self.post("preview", self.draft_body(product="Navoy"))
+        status, r = self.post("preview", self.draft_body(product="Acme"))
         self.assertEqual((status, r["count"]), (200, 2))
-        self.assertEqual(r["previews"][0]["body"], "Hi Ana, try Navoy. - Sam")
-        self.assertEqual(self.post("draft", self.draft_body(product="Navoy"))[0], 200)
+        self.assertEqual(r["previews"][0]["body"], "Hi Ana, try Acme. - Sam")
+        self.assertEqual(self.post("draft", self.draft_body(product="Acme"))[0], 200)
         _, m = self.post("messages", {"campaign": "web", "status": "draft"})
         self.assertEqual(len(m["messages"]), 2)
         mid = m["messages"][0]["id"]
