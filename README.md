@@ -106,6 +106,31 @@ prints what is set up and what is missing. The usual causes:
 | "3 failures in a row" | LinkedIn changed its page. Look at the screenshots in `failures/`; the selectors are at the top of `linkedin_browser.py`. |
 | "Can't listen on port 8765" | The page is already running: open http://127.0.0.1:8765, or start with `python3 start.py --port 8766`. |
 
+## Using it with Claude Code
+
+If you use [Claude Code](https://claude.com/claude-code), you can skip the page and the
+commands: open this folder in it and say what you want.
+
+```bash
+cd autolink-messenger
+claude
+```
+
+Things to ask:
+
+- "Set this up and check that everything works."
+- "Import my LinkedIn connections."
+- "Draft a campaign to the founders I connected with this year, asking them to try my app.
+  Show me three examples before saving."
+- "Do a test run, then send today's 20."
+- "Who replied this week?"
+- "LinkedIn changed something and sending fails. Look at the screenshots and fix it."
+
+[CLAUDE.md](CLAUDE.md) in this folder gives Claude its working rules: it shows you the
+message and the audience and waits for your yes before every real send, keeps to the daily
+cap unless you raise it for a run, doesn't read profiles in bulk, and stops when LinkedIn
+shows a warning. You still log in to LinkedIn yourself, in the browser window that opens.
+
 ## The command line
 
 Everything the page does is also a command, for scripting or scheduling. The
