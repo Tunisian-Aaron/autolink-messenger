@@ -596,7 +596,7 @@ class AutosendTest(unittest.TestCase):
         ai = FakeClaude()
         args = outreach.build_parser().parse_args(
             ["--db", self.dbpath, "autosend", "c", "--headless", "--yes", "--min-delay", "0", "--max-delay", "0",
-             "--personalize", "--profile-dir", str(Path(self.tmp.name) / "profile"),
+             "--personalize", "--read-profiles", "--profile-dir", str(Path(self.tmp.name) / "profile"),
              "--screenshots", str(Path(self.tmp.name) / "shots")])
         outreach.cmd_autosend(db, args, sleep=lambda s: None, ai=ai)
         self.assertEqual(sorted(s["text"] for s in Handler.sent),
@@ -621,7 +621,7 @@ class AutosendTest(unittest.TestCase):
         self.assertIn("Raj: Likewise!", threads.pop("Raj"))
         self.assertEqual(list(threads.values()), [None])
 
-    def test_personalize_without_reading_profiles(self):
+    def test_personalize_reads_no_profile_unless_asked(self):
         class FakeClaude:
             name = "fake"
             prompts = []
@@ -637,8 +637,11 @@ class AutosendTest(unittest.TestCase):
         ai = FakeClaude()
         args = outreach.build_parser().parse_args(
             ["--db", self.dbpath, "autosend", "c", "--headless", "--yes", "--min-delay", "0", "--max-delay", "0",
-             "--personalize", "--no-profile-read", "--profile-dir", str(Path(self.tmp.name) / "profile"),
+             "--personalize", "--profile-dir", str(Path(self.tmp.name) / "profile"),
              "--screenshots", str(Path(self.tmp.name) / "shots")])
+        self.assertFalse(args.read_profiles)
+        # the old flag for this, from when reading was the default, still parses
+        outreach.build_parser().parse_args(["autosend", "c", "--personalize", "--no-profile-read"])
         outreach.cmd_autosend(db, args, sleep=lambda s: None, ai=ai)
         self.assertEqual(len(Handler.sent), 2)
         self.assertEqual(db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0], 0)  # no details pages opened

@@ -1,59 +1,129 @@
 # AutoLink Messenger
 
-A command-line tool for messaging your LinkedIn connections, for example to ask
-people to try a new product or to open investor conversations. It handles the
-tedious parts: importing your connections, picking who to contact, drafting a
-personal message for each person, tracking who you've messaged and who replied,
-and moving you through the queue quickly. It can also reach people you aren't
-connected to yet, with a connection request that carries a personal note.
+Message your LinkedIn connections one by one, without doing it by hand: to ask
+people to try a product, to open investor conversations, to invite them to
+something. It imports your connections, lets you pick who to write to, drafts a
+message for each person from your template, sends them from your own LinkedIn
+account at a slow, human pace, and tracks who replied. It can also reach people
+you aren't connected to yet, with a connection request that carries a note.
+
+Everything runs on your computer. Your connections, messages and LinkedIn login
+never leave it.
+
+> **Read this first: account risk.** LinkedIn's User Agreement prohibits
+> automated messaging, and LinkedIn can warn, restrict or ban accounts it
+> catches. The defaults (20 messages a day, 1 to 3 minutes apart, no extra
+> profile views) are deliberately cautious, and raising them raises the risk.
+> The tool stops at once if LinkedIn shows a login wall, a security check or a
+> restriction notice. It makes no attempt to hide that it's automated and
+> doesn't solve CAPTCHAs. Use it on your own account, at your own risk.
+
+## Quick start
+
+You need **Python 3.9 or newer** ([python.org/downloads](https://www.python.org/downloads/);
+Macs usually have it already) and about 500 MB of free disk space.
+
+1. Download this folder (the green **Code** button → **Download ZIP**, then
+   unzip it) or `git clone` it.
+2. Open a terminal in the folder and run:
+
+   ```bash
+   python3 start.py
+   ```
+
+   On Windows: `py start.py`. The first run takes a few minutes: it installs
+   what the tool needs into a `.venv` folder here, and downloads the browser it
+   drives. After that it starts in a second.
+3. A page opens in your browser at http://127.0.0.1:8765. It walks you through
+   four tabs:
+
+   | Tab | What you do there |
+   |---|---|
+   | **1. Contacts** | Import your connections from LinkedIn and filter who to message. |
+   | **2. Write** | Write the message (or start from a template), preview it, create the drafts. |
+   | **3. Review** | Read and edit individual messages, skip people, mark replies. |
+   | **4. Send** | Do a **Test run** first (it types three messages and sends nothing), then **Start sending**. |
+
+The first time a browser window opens on LinkedIn's login page, log in there,
+including any 2FA. The tool never sees your password, and the login is
+remembered on this computer. Keep the terminal window open while you use the
+page; closing it stops a run. A stop always lands between two messages, never
+in the middle of one.
+
+To start it again later, run `python3 start.py` again. To update, replace the
+folder's files with the new version (or `git pull`); your data stays.
+
+### Good habits
+
+- **Start small.** Do the test run, then send 5 real messages and look at them
+  in LinkedIn before sending more.
+- **Stay near 20 a day.** That is the default cap, across all campaigns.
+- **Write like yourself.** A short, specific message to people who know you
+  gets replies; a pitch to your whole network gets you reported.
+- **Mark people you'd rather not message** with *Never contact*. They are left
+  out of every campaign.
+
+### Optional: let Claude personalize
+
+With Claude set up, the tool can rewrite each message for the person it goes to
+(and continue a conversation you already have with them, instead of
+re-introducing you), and sort your connections into groups such as *founder* or
+*investor*. Two ways to set it up, whichever you have:
+
+- **An Anthropic API key.** Copy `.env.example` to `.env` in this folder and put
+  the key after `ANTHROPIC_API_KEY=`. Usage is billed to that account.
+- **Claude Code** installed and logged in on this computer. Nothing to
+  configure; usage counts toward that plan.
+
+Without either, everything else works and messages go out as your template
+wrote them.
+
+### Where your data lives
+
+| What | Where |
+|---|---|
+| Connections, campaigns, messages | `outreach.db` in this folder (SQLite) |
+| Your LinkedIn login (browser session) | `~/.outreach-linkedin-profile`. Keep it private: whoever has this folder can use your LinkedIn session |
+| API key and settings | `.env` in this folder |
+| Screenshots of failed sends | `failures/` in this folder |
+
+None of these are tracked by git. To move to another computer, copy
+`outreach.db` (you log in to LinkedIn again there). To start over, delete it.
+
+### If something doesn't work
+
+```bash
+.venv/bin/python outreach.py check        # Windows: .venv\Scripts\python outreach.py check
+```
+
+prints what is set up and what is missing. The usual causes:
+
+| What you see | What to do |
+|---|---|
+| "The automation browser isn't downloaded yet" | Run `python3 start.py` again; it finishes the install. |
+| The browser window shows LinkedIn's login page | Log in there. The run continues by itself. |
+| "STOPPED: LinkedIn is showing a ... notice" | Open LinkedIn yourself and see what it says. Don't send more until it's cleared. |
+| "3 failures in a row" | LinkedIn changed its page. Look at the screenshots in `failures/`; the selectors are at the top of `linkedin_browser.py`. |
+| "Can't listen on port 8765" | The page is already running: open http://127.0.0.1:8765, or start with `python3 start.py --port 8766`. |
+
+## The command line
+
+Everything the page does is also a command, for scripting or scheduling. The
+page and the commands use the same database, so you can switch between them.
+The commands below assume the tool's environment is active (`source
+.venv/bin/activate`, or on Windows `.venv\Scripts\activate`); or install by
+hand into your own: `pip install -r requirements.txt && playwright install
+chromium`.
 
 There are two ways to send:
 
 - **`autosend`, fully automated.** Drives a browser that's logged in to your
   LinkedIn account. For each message it opens the profile, clicks *Message*,
   types the text and clicks *Send*, then waits 1-3 minutes before the next one.
-  It stops at a daily cap.
+  It stops at a daily cap. This is what the page's Send tab runs.
 - **`send`, assisted.** Copies each message to your clipboard and opens the
-  profile, and you press Send yourself (about 10 seconds a person).
-
-> **Account risk with `autosend`:** LinkedIn's User Agreement prohibits
-> automated messaging. LinkedIn can warn, restrict, or ban accounts it catches.
-> The defaults (20 messages a day, 60-180 seconds apart) are conservative.
-> Raising them increases the risk. The tool stops immediately if LinkedIn shows
-> a login wall, a security check or a restriction notice. It makes no attempt
-> to hide that it's automated and doesn't solve CAPTCHAs.
-
-Needs Python 3.9+. `autosend` also needs Playwright
-(`pip install playwright && playwright install chromium`), and the optional
-`--ai` flag needs `pip install anthropic`.
-
-## Easiest: the web page
-
-```bash
-pip install playwright && playwright install chromium   # once
-python webapp.py
-```
-
-This opens a page in your browser at http://127.0.0.1:8765 with four tabs:
-
-1. **Contacts:** import your connections straight from LinkedIn (or from
-   `Connections.csv`) and filter who to message.
-2. **Write:** write or pick a template, fill in your details, preview, and
-   create the drafts.
-3. **Review:** edit or skip individual messages, mark replies, and requeue
-   failures.
-4. **Send:** do a test run, then **Start sending**. You can watch progress live
-   and press Stop at any time; a stop lands between messages, never mid-send.
-
-The first time a browser window opens on LinkedIn's login page, log in there
-(the tool never sees your password); everything carries on by itself after that.
-
-The page and everything it stores stay on your computer. The server only
-listens on 127.0.0.1, rejects requests coming from other websites, and uses the
-same `outreach.db` as the command-line tool, so you can switch between the two.
-Keep the terminal window open while it's sending; closing it stops the run.
-
-The rest of this README covers the command-line version.
+  profile, and you press Send yourself (about 10 seconds a person). No
+  automation, so no account risk.
 
 ## 1. Get your connections
 
@@ -106,7 +176,8 @@ There are also `--exclude-title`, `--exclude-company`, `--since`, `--before`,
 Keyword filters misfire: `--title remote` matches "remote patient monitoring",
 and a "Founder" of a bakery and a "Founding Engineer" look alike. `tag` has
 Claude read each headline in context and sort people into groups you define,
-25 people per call (a network of 5,000 takes about 15 minutes and costs cents):
+25 people per call (a network of 5,000 takes about 15 minutes; on the API that
+is roughly 200 short calls, a few dollars at most):
 
 ```bash
 python outreach.py tag --tags "founder: started or runs a company
@@ -158,11 +229,17 @@ python outreach.py import-drafts beta-oct exports/beta-oct.csv  # ...and load th
 
 ### Making each message personal
 
-Template messages read like templates. `personalize` fixes that in two steps:
-it reads each person's LinkedIn profile (About, Experience, Education; three
-page loads per person, paced), then has Claude rewrite their draft around one
-or two real details from it, keeping the structure, the ask, the links and the
-sign-off, and using only facts from the profile.
+Template messages read like templates. `personalize` has Claude rewrite each
+draft for the person it goes to, keeping the structure, the ask, the links and
+the sign-off, and using only facts it was given about them. By default those
+facts are what is already stored: name, headline, company and title. With
+`--enrich` it first reads the person's LinkedIn profile (About, Experience,
+Education; three page loads per person, paced) and writes around one or two
+real details from it.
+
+Reading profiles is the heaviest thing this tool does on LinkedIn, and LinkedIn
+limits how many profiles an account may view, so it only happens when you ask
+for it, and it is worth keeping to small batches (`--max 20`).
 
 Each rewrite also sees the opening lines of the campaign's last few messages, so
 twenty messages in a row don't all start the same way: every person gets a hook
@@ -182,10 +259,11 @@ rewrite also sees when each message was sent and today's date, so a dinner
 proposed in March isn't mistaken for a plan this week. The earlier conversation
 is kept with the message, so the Review tab shows it above what was sent.
 
-Reading a profile's About, Experience and Education takes three extra page
-loads per person. To keep LinkedIn traffic low, `autosend --personalize
---no-profile-read` rewrites from what is already stored (headline, company,
-title) plus the conversation, so each person costs one page load.
+`autosend --personalize` rewrites from what is already stored (headline,
+company, title, and any profile read earlier) plus the conversation, so each
+person costs one page load. Add `--read-profiles` to also open the person's
+About, Experience and Education first: more to write from, three more page
+loads a person.
 
 ```bash
 python outreach.py personalize beta-oct --enrich \
@@ -210,12 +288,14 @@ when `autosend --personalize` rewrites a message just before sending it.
 
 Claude is reached one of two ways, whichever is available:
 
+- **The Claude API**, when `ANTHROPIC_API_KEY` is set. Billed to that account.
+  Put the key in a `.env` file next to `outreach.py` (copy `.env.example`; the
+  file is gitignored) and both the command line and the web page pick it up.
 - **Claude Code** already installed and logged in on this computer (`claude
-  login`). Generation counts toward that plan's usage, no API key needed.
-- **The Claude API**, when `ANTHROPIC_API_KEY` is set and `pip install
-  anthropic` is done. Billed to that account. Put the key in a `.env` file
-  next to `outreach.py` (`ANTHROPIC_API_KEY=sk-ant-...`; the file is
-  gitignored) and both the command line and the web page pick it up.
+  login`), when no key is set. Generation counts toward that plan's usage.
+
+The model is `claude-opus-5-5`; set `OUTREACH_AI_MODEL` in `.env` to use
+another.
 
 Claude sees the campaign brief, the draft, and the profile text; never emails.
 `draft --ai` does the same rewrite at drafting time, using whatever profiles
@@ -275,7 +355,7 @@ Scheduler, using `--yes` to skip the confirmation prompt. The computer has to
 be on, and the saved login has to still be valid. For example, weekdays at 10:15:
 
 ```
-15 10 * * 1-5  cd /path/to/linkedin-outreach && python outreach.py autosend beta-oct --yes >> autosend.log 2>&1
+15 10 * * 1-5  cd /path/to/autolink-messenger && .venv/bin/python outreach.py autosend beta-oct --yes >> autosend.log 2>&1
 ```
 
 ### Assisted: `send`
@@ -363,8 +443,8 @@ rate for each campaign.
 To undo a campaign: `delete-drafts NAME` removes its unsent messages and keeps
 the record of what was sent; `delete-campaign NAME` removes everything (it
 refuses when messages were sent unless you pass `--force`). Both are on the
-Review tab too. Your data lives in `outreach.db` (SQLite, gitignored); set
-`--db` or `OUTREACH_DB` to keep it somewhere else.
+Review tab too. Your data lives in `outreach.db` next to `outreach.py` (SQLite,
+gitignored); set `--db` or `OUTREACH_DB` to keep it somewhere else.
 
 ## Before you message investors
 
@@ -381,6 +461,7 @@ securities in the first message. Check with your counsel.
 python -m unittest discover -s tests
 ```
 
-`tests/test_autosend.py` runs the real automation in a headless browser against
-a local mock of LinkedIn's profile and messaging UI. It's skipped if Playwright
-isn't installed. It never contacts LinkedIn.
+The browser tests run the real automation in a headless browser against a local
+mock of LinkedIn's profile, messaging and connections pages. They're skipped if
+Playwright isn't installed, and they never contact LinkedIn. The whole suite
+takes a few minutes, most of it waiting out the timeouts of the failure cases.

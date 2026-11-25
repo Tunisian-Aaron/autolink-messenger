@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Local web interface for the LinkedIn outreach tool.
+"""Local web interface for AutoLink Messenger.
 
+    python3 start.py            # sets everything up the first time, then runs this
     python webapp.py            # opens http://127.0.0.1:8765 in your browser
 
 Everything runs on your computer: the page talks to this small server, which
@@ -11,6 +12,7 @@ and rejects requests from other websites.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import subprocess
@@ -99,9 +101,24 @@ class App:
         self.channel = channel
         self.job: Job | None = None
         self.lock = threading.Lock()
+        self._setup = {"problem": None, "checked": 0.0}
 
     def db(self):
-        return outreach.connect(self.db_path)
+        """A connection for one request; use it as `with self.db() as db:` so it is closed after."""
+        return contextlib.closing(outreach.connect(self.db_path))
+
+    @staticmethod
+    def ai_name():
+        """How Claude is reached, or None. A key added to .env while the page is open is picked up."""
+        return outreach.ai_backend_name() or (outreach.load_env_file() or outreach.ai_backend_name())
+
+    def setup_problem(self):
+        """Why the automation browser can't start, or None. Checked on the first request, then
+        again (at most every 10 s) only while there is a problem, so fixing it clears the notice."""
+        s = self._setup
+        if not s["checked"] or (s["problem"] and time.monotonic() - s["checked"] > 10):
+            s["problem"], s["checked"] = outreach.browser_problem(self.channel), time.monotonic()
+        return s["problem"]
 
     # -- helpers ----------------------------------------------------------------
     @staticmethod
@@ -162,14 +179,8 @@ class App:
                 job.log.append("\nStopped by you.\n")
             except SystemExit as e:
                 job.log.append(f"\n{e}\n")
-            except Exception as e:
-                first = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
-                hint = ""
-                if "Executable doesn't exist" in str(e):
-                    hint = "\nRun: playwright install chromium\n"
-                elif "Missing X server" in str(e) or "$DISPLAY" in str(e):
-                    hint = "\nThis computer has no display - tick 'Hide the browser window' and try again.\n"
-                job.log.append(f"\nError: {first}{hint}")
+            except Exception as e:  # the commands explain their own failures; this is the job runner's
+                job.log.append(f"\nError: {outreach.friendly_error(e) or (str(e).strip().splitlines() or [type(e).__name__])[0]}\n")
             finally:
                 ROUTER.targets.pop(threading.get_ident(), None)
                 job.running = False
@@ -180,25 +191,31 @@ class App:
 
     # -- endpoints --------------------------------------------------------------
     def api_state(self, b):
-        db = self.db()
-        camps = []
-        for k in db.execute("SELECT * FROM campaigns ORDER BY id DESC"):
-            counts = dict(db.execute("SELECT status, COUNT(*) FROM messages WHERE campaign_id=? "
-                                     "GROUP BY status", (k["id"],)).fetchall())
-            camps.append({"name": k["name"], "template": k["template"], "brief": k["brief"] or "",
-                          "counts": {s: counts.get(s, 0) for s in outreach.STATUSES}})
+        with self.db() as db:
+            counts = {}
+            for cid, status, n in db.execute("SELECT campaign_id, status, COUNT(*) FROM messages GROUP BY 1, 2"):
+                counts.setdefault(cid, {})[status] = n
+            camps = [{"name": k["name"], "template": k["template"], "brief": k["brief"] or "",
+                      "counts": {s: counts.get(k["id"], {}).get(s, 0) for s in outreach.STATUSES}}
+                     for k in db.execute("SELECT * FROM campaigns ORDER BY id DESC")]
+            people = dict(db.execute("SELECT CASE WHEN prospect=0 THEN 'contacts' ELSE 'prospects' END, COUNT(*) "
+                                     "FROM contacts GROUP BY 1").fetchall())
+            dnc = db.execute("SELECT COUNT(*) FROM contacts WHERE do_not_contact=1").fetchone()[0]
+            sent_24h = outreach.sent_last_24h(db)
         templates = {p.stem: p.read_text(encoding="utf-8")
                      for p in sorted((HERE / "templates").glob("*.txt"))}
         job = self.job
         return {
-            "contacts": db.execute("SELECT COUNT(*) FROM contacts WHERE prospect=0").fetchone()[0],
-            "prospects": db.execute("SELECT COUNT(*) FROM contacts WHERE prospect>0").fetchone()[0],
-            "do_not_contact": db.execute("SELECT COUNT(*) FROM contacts WHERE do_not_contact=1").fetchone()[0],
-            "sent_24h": outreach.sent_last_24h(db),
+            "contacts": people.get("contacts", 0),
+            "prospects": people.get("prospects", 0),
+            "do_not_contact": dnc,
+            "sent_24h": sent_24h,
+            "daily_cap": outreach.DEFAULT_DAILY_CAP,
             "campaigns": camps,
             "templates": templates,
             "logged_in_before": Path(self.profile_dir).exists(),
-            "ai": outreach.ai_backend_name(),
+            "ai": self.ai_name(),
+            "setup_problem": self.setup_problem(),
             "job": {"kind": job.kind, "running": job.running, "log": job.text()} if job else None,
         }
 
@@ -210,7 +227,8 @@ class App:
             f.write(text)
             path = f.name
         try:
-            out = captured(lambda: outreach.cmd_import(self.db(), argparse.Namespace(csv=path)))
+            with self.db() as db:
+                out = captured(lambda: outreach.cmd_import(db, argparse.Namespace(csv=path)))
         finally:
             Path(path).unlink(missing_ok=True)
         return {"message": out}
@@ -243,10 +261,13 @@ class App:
             raise ApiError("Pick a campaign.")
         if not brief:
             raise ApiError("Say what this campaign is for first - Claude needs it to adapt each message.")
-        if not outreach.ai_backend_name():
-            raise ApiError("Claude isn't reachable: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.")
+        if not self.ai_name():
+            raise ApiError("Claude isn't set up yet: copy .env.example to .env and put your Anthropic API key in it, "
+                           "or install Claude Code and log in.")
         cmd = self.outreach_cmd("personalize", campaign, "--brief", brief, *self.browser_opts())
-        if b.get("enrich", True):
+        if b.get("max"):
+            cmd += ["--max", str(int(b["max"]))]
+        if b.get("enrich"):  # three page loads a person on LinkedIn, so only when asked
             cmd.append("--enrich")
         if b.get("redo"):
             cmd.append("--redo")
@@ -289,7 +310,8 @@ class App:
         return self.start_job(kind, run)
 
     def api_contacts(self, b):
-        rows = outreach.select_contacts(self.db(), self.filters(b.get("filters")))
+        with self.db() as db:
+            rows = outreach.select_contacts(db, self.filters(b.get("filters")))
         return {"contacts": [{**{k: r[k] for k in ("id", "first_name", "last_name", "position", "company",
                                                     "connected_on", "url")}, "tags": outreach.tags_of(r)} for r in rows]}
 
@@ -297,8 +319,9 @@ class App:
         spec = (b.get("tags") or "").strip()
         if not outreach.parse_tag_spec(spec):
             raise ApiError("List the groups first, one per line, like: founder: started a company")
-        if not outreach.ai_backend_name():
-            raise ApiError("Claude isn't reachable: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.")
+        if not self.ai_name():
+            raise ApiError("Claude isn't set up yet: copy .env.example to .env and put your Anthropic API key in it, "
+                           "or install Claude Code and log in.")
         cmd = self.outreach_cmd("tag", "--tags", spec, *self.filter_argv(b.get("filters")))
         if b.get("redo"):
             cmd.append("--redo")
@@ -306,8 +329,9 @@ class App:
         return {"ok": True}
 
     def api_preview(self, b):
-        db, ns = self.db(), self.draft_ns(b, dry_run=True)
-        contacts = outreach.draft_candidates(db, ns)
+        ns = self.draft_ns(b, dry_run=True)
+        with self.db() as db:
+            contacts = outreach.draft_candidates(db, ns)
         sender = outreach.sender_values(ns)
         # Your own fields without a {x|fallback} must be filled, or messages go out with gaps.
         blanks = sorted({m.group(1) for m in outreach.PLACEHOLDER.finditer(ns.template_text)
@@ -329,18 +353,31 @@ class App:
 
     def api_draft(self, b):
         self.api_preview(b)  # validates placeholders before anything is saved
-        out = captured(lambda: outreach.cmd_draft(self.db(), self.draft_ns(b, dry_run=False)))
+        with self.db() as db:
+            out = captured(lambda: outreach.cmd_draft(db, self.draft_ns(b, dry_run=False)))
         return {"message": out}
 
     def api_messages(self, b):
-        rows = outreach.campaign_messages(self.db(), b.get("campaign") or "", b.get("status") or None)
-        return {"messages": [{k: r[k] for k in ("id", "contact_id", "first_name", "last_name", "url",
+        """One page of a campaign's messages (the first `limit`), plus how many there are in all:
+        a campaign can hold thousands, and the page shows fifty at a time."""
+        campaign, status = b.get("campaign") or "", b.get("status") or None
+        limit = int(b["limit"]) if b.get("limit") else None
+        with self.db() as db:
+            rows = outreach.campaign_messages(db, campaign, status, limit=limit)
+            total = outreach.count_messages(db, campaign, status) if limit else len(rows)
+        return {"total": total,
+                "messages": [{k: r[k] for k in ("id", "contact_id", "first_name", "last_name", "url",
                                                  "company", "position", "status", "body", "error",
                                                  "sent_at", "ai_at", "thread", "prospect")} for r in rows]}
 
     def api_update_message(self, b):
-        db = self.db()
         mid = int(b["id"])
+        with self.db() as db:
+            self._update_message(db, mid, b)
+        return {"ok": True}
+
+    @staticmethod
+    def _update_message(db, mid, b):
         if "body" in b:
             body = (b["body"] or "").strip()
             if not body:
@@ -354,12 +391,12 @@ class App:
                        "updated_at=? WHERE id=?",
                        (b["status"], b["status"], b["status"], outreach.now(), outreach.now(), mid))
         db.commit()
-        return {"ok": True}
 
     def api_dnc(self, b):
-        db = self.db()
-        db.execute("UPDATE contacts SET do_not_contact=? WHERE id=?", (0 if b.get("undo") else 1, int(b["contact_id"])))
-        db.commit()
+        with self.db() as db:
+            db.execute("UPDATE contacts SET do_not_contact=? WHERE id=?",
+                       (0 if b.get("undo") else 1, int(b["contact_id"])))
+            db.commit()
         return {"ok": True}
 
     def api_login_start(self, b):
@@ -371,18 +408,20 @@ class App:
         return {"ok": True}
 
     def api_delete_drafts(self, b):
-        out = captured(lambda: outreach.cmd_delete_drafts(self.db(), argparse.Namespace(campaign=b.get("campaign") or "")))
+        with self.db() as db:
+            out = captured(lambda: outreach.cmd_delete_drafts(db, argparse.Namespace(campaign=b.get("campaign") or "")))
         return {"message": out}
 
     def api_delete_campaign(self, b):
-        out = captured(lambda: outreach.cmd_delete_campaign(
-            self.db(), argparse.Namespace(campaign=b.get("campaign") or "", force=bool(b.get("force")))))
+        with self.db() as db:
+            out = captured(lambda: outreach.cmd_delete_campaign(
+                db, argparse.Namespace(campaign=b.get("campaign") or "", force=bool(b.get("force")))))
         return {"message": out}
 
     def api_autosend(self, b):
         campaign = b.get("campaign") or ""
         argv = ["autosend", campaign, "--yes",
-                "--daily-cap", str(int(b.get("daily_cap") or 20)),
+                "--daily-cap", str(int(b.get("daily_cap") or outreach.DEFAULT_DAILY_CAP)),
                 "--min-delay", str(float(b["min_delay"] if b.get("min_delay") not in (None, "") else 60)),
                 "--max-delay", str(float(b["max_delay"] if b.get("max_delay") not in (None, "") else 180)),
                 "--profile-dir", self.profile_dir,
@@ -395,6 +434,8 @@ class App:
             argv.append("--headless")
         if b.get("personalize"):
             argv.append("--personalize")
+            if b.get("read_profiles"):
+                argv.append("--read-profiles")
         if b.get("without_note"):
             argv.append("--without-note")
         if self.channel:
@@ -481,7 +522,7 @@ def make_handler(app: App, port: int):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Local web interface for the LinkedIn outreach tool.")
+    p = argparse.ArgumentParser(description="Local web interface for AutoLink Messenger.")
     p.add_argument("--db", default=outreach.DEFAULT_DB)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--profile-dir", help="browser profile for your LinkedIn login")
@@ -497,7 +538,8 @@ def main(argv=None):
         raise SystemExit(f"Can't listen on port {args.port} ({e.strerror}). Is the app already running? "
                          f"Open http://127.0.0.1:{args.port}, or start this one with --port {args.port + 1}.")
     url = f"http://127.0.0.1:{args.port}"
-    print(f"Outreach is running at {url}  (Ctrl-C to quit)\nDatabase: {Path(args.db).resolve()}")
+    print(f"AutoLink Messenger is running at {url}\nKeep this window open while you use it; press Ctrl-C here to quit.\n"
+          f"Your data: {Path(args.db).resolve()}")
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

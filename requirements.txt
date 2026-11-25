@@ -1,0 +1,4 @@
+# Installed by `python3 start.py`. By hand: pip install -r requirements.txt && playwright install chromium
+playwright>=1.45
+# Only used when ANTHROPIC_API_KEY is set (personalizing and sorting people with Claude through the API).
+anthropic>=0.125,<1

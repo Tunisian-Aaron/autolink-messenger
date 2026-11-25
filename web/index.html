@@ -89,6 +89,9 @@
   .steps li::before { content: counter(s); position: absolute; left: 0; top: 1px; width: 21px; height: 21px;
                       border-radius: 50%; background: var(--accent-soft); color: var(--accent);
                       font-size: 12px; font-weight: 700; display: grid; place-items: center; }
+  .guide { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 14.5px; }
+  .check { display: flex; gap: 6px; align-items: flex-start; margin: 0; color: var(--text); font-size: 14px; }
+  .check input { margin-top: 4px; }
   .empty { color: var(--muted); padding: 14px 0; }
   a { color: var(--accent); }
 </style>
@@ -110,6 +113,8 @@
 </header>
 
 <main>
+<div class="warnbox" id="setup-problem" style="display:none"></div>
+<div class="guide" id="guide" style="display:none"></div>
 <!-- ======================= CONTACTS ======================= -->
 <section id="tab-contacts" class="active">
   <div class="card">
@@ -243,13 +248,17 @@ https://www.linkedin.com/in/someone-else, Jane Doe"></textarea>
 
   <div class="card">
     <h2>Make each message personal</h2>
-    <p class="hint">Reads each person's LinkedIn profile (About, Experience, Education) in the browser window, then has Claude rewrite their waiting draft around one or two real details from it: same structure, ask and links, no invented facts. You still read every message before sending. <span id="ai-status"></span></p>
+    <p class="hint">Claude rewrites each waiting draft for the person it goes to, from their headline and company: same structure, ask and links, no invented facts. You still read every message before sending. <span id="ai-status"></span></p>
     <div class="grid">
       <div style="grid-column:1/-1"><label>What this campaign is for (Claude reads this)</label><input id="p-brief" placeholder="e.g. Get honest product feedback on Acme from founders and investors, and open the door to a call"></div>
+      <div><label>How many (the next waiting messages)</label><input id="p-max" type="number" min="1" value="20" placeholder="all of them"></div>
+    </div>
+    <div class="row">
+      <label class="check"><input type="checkbox" id="p-enrich"> Read each person's full profile first (About, Experience, Education). More to write from, but three page views a person, and LinkedIn limits how many profiles an account may view.</label>
+      <label class="check"><input type="checkbox" id="p-redo"> Redo ones already personalized</label>
     </div>
     <div class="row">
       <button class="btn primary" id="btn-personalize">Personalize waiting messages</button>
-      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="p-redo"> Redo ones already personalized</label>
       <button class="btn danger" id="btn-personalize-stop" style="display:none">Stop</button>
     </div>
     <div class="msg" id="personalize-msg"></div>
@@ -270,10 +279,11 @@ https://www.linkedin.com/in/someone-else, Jane Doe"></textarea>
       <div><label>Wait between messages (seconds)</label>
         <div style="display:flex;gap:6px"><input id="s-min" type="number" min="0" value="60"><input id="s-maxd" type="number" min="0" value="180"></div></div>
     </div>
-    <div class="row">
-      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-personalize"> Personalize each message from their profile right before sending (needs the campaign's brief on the Review tab)</label>
-      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-nonote"> Send connection requests without a note (for when LinkedIn's monthly notes run out); each message then goes out once the person accepts</label>
-      <label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="s-headless"> Hide the browser window</label>
+    <div class="row" style="flex-direction:column;align-items:flex-start">
+      <label class="check"><input type="checkbox" id="s-personalize"> Personalize each message right before sending: Claude rewrites it for the person and continues any conversation you already have with them (needs the campaign's brief on the Review tab)</label>
+      <label class="check" style="margin-left:24px"><input type="checkbox" id="s-profiles"> ...and read their full profile first (three more page views a person; LinkedIn limits profile views)</label>
+      <label class="check"><input type="checkbox" id="s-nonote"> Send connection requests without a note (for when LinkedIn's monthly notes run out); each message then goes out once the person accepts</label>
+      <label class="check"><input type="checkbox" id="s-headless"> Hide the browser window</label>
     </div>
     <div class="row">
       <button class="btn" id="btn-test">Test run (types 3 messages, doesn't send)</button>
@@ -350,8 +360,26 @@ async function refresh() {
     $('w-template-pick').innerHTML = '<option value="">-</option>' +
       Object.keys(state.templates).map(n => `<option>${esc(n)}</option>`).join('');
   }
-  renderStats(); renderJob(); updateQueue();
+  renderStats(); renderJob(); updateQueue(); renderGuide();
   $('login-status').textContent = state.logged_in_before ? 'A saved login exists on this computer.' : 'Not logged in yet.';
+  $('btn-login').textContent = state.logged_in_before ? 'Log in again' : 'Log in now';
+}
+
+// What to do next, for someone who has just opened the tool; gone once a campaign is under way.
+const tabLink = (tab, label) => `<a href="#" onclick="openTab('${tab}');return false">${label}</a>`;
+function renderGuide() {
+  $('setup-problem').style.display = state.setup_problem ? '' : 'none';
+  $('setup-problem').textContent = state.setup_problem ? 'Setup isn\'t finished. ' + state.setup_problem : '';
+  const sent = state.campaigns.reduce((n, c) => n + c.counts.sent + c.counts.replied, 0);
+  const waiting = state.campaigns.reduce((n, c) => n + c.counts.draft, 0);
+  let html = '';
+  if (!state.contacts && !state.prospects)
+    html = `<b>Start here:</b> press <b>Import from LinkedIn</b> on the ${tabLink('contacts', 'Contacts')} tab. A browser window opens; if LinkedIn asks, log in there. Nothing is ever sent until you press <b>Start sending</b> in step 4.`;
+  else if (!state.campaigns.length)
+    html = `<b>Next:</b> choose who to message on the ${tabLink('contacts', 'Contacts')} tab (leave the filters empty for everyone), then write your message on the ${tabLink('write', 'Write')} tab.`;
+  else if (waiting && !sent)
+    html = `<b>Next:</b> read your drafts on the ${tabLink('review', 'Review')} tab, then press <b>Test run</b> on the ${tabLink('send', 'Send')} tab. It types three messages without sending them, so you can see it work.`;
+  $('guide').innerHTML = html; $('guide').style.display = html ? '' : 'none';
 }
 
 function renderStats() {
@@ -405,6 +433,7 @@ async function search() {
 }
 $('contacts-table').onclick = async (e) => {
   const id = e.target.dataset.dnc; if (!id) return;
+  if (!confirm('Never contact this person in any campaign?')) return;
   await api('dnc', { contact_id: id }); await search(); await refresh();
 };
 $('btn-search').onclick = () => guard($('btn-search'), search);
@@ -495,7 +524,8 @@ function loadBrief() {
 }
 $('btn-personalize').onclick = () => guard($('btn-personalize'), async () => {
   hide('personalize-msg');
-  await api('personalize', { campaign: $('r-campaign').value, brief: $('p-brief').value, redo: $('p-redo').checked });
+  await api('personalize', { campaign: $('r-campaign').value, brief: $('p-brief').value, redo: $('p-redo').checked,
+                             max: $('p-max').value, enrich: $('p-enrich').checked });
   startPolling();
 }, 'personalize-msg');
 $('btn-personalize-stop').onclick = () => api('stop');
@@ -506,9 +536,9 @@ async function loadMessages(more) {
   const campaign = $('r-campaign').value;
   if (!campaign) { $('r-list').innerHTML = '<p class="empty">Create a campaign on the Write tab first.</p>'; return; }
   shown = more ? shown + PAGE : PAGE;
-  const r = await api('messages', { campaign, status: $('r-status').value });
-  const rest = r.messages.length - shown;
-  $('r-list').innerHTML = r.messages.slice(0, shown).map(m => {
+  const r = await api('messages', { campaign, status: $('r-status').value, limit: shown });
+  const rest = r.total - r.messages.length;
+  $('r-list').innerHTML = r.messages.map(m => {
     const draft = m.status === 'draft';
     const actions = draft
       ? `<button class="btn small" data-act="save">Save</button><button class="btn small" data-act="skipped">Skip</button>`
@@ -551,7 +581,8 @@ $('r-list').onclick = async (e) => {
 // ---------- send ----------
 ['s-cap', 's-max', 's-min', 's-maxd'].forEach(id => { $(id).value = store.get(id, $(id).value); $(id).oninput = () => store.set(id, $(id).value); });
 $('s-campaign').onchange = () => { store.set('s-campaign', $('s-campaign').value); updateQueue(); };
-['s-headless', 's-personalize'].forEach(id => { $(id).checked = store.get(id, false); $(id).onchange = () => store.set(id, $(id).checked); });
+['s-headless', 's-personalize', 's-profiles', 'p-enrich'].forEach(id => { $(id).checked = store.get(id, false); $(id).onchange = () => store.set(id, $(id).checked); });
+$('p-max').value = store.get('p-max', $('p-max').value); $('p-max').oninput = () => store.set('p-max', $('p-max').value);
 function updateQueue() {
   const c = state && state.campaigns.find(c => c.name === $('s-campaign').value);
   $('s-queue').textContent = c ? `${c.counts.draft} waiting in this campaign` : '';
@@ -561,6 +592,7 @@ function sendBody(dry) {
   return { campaign: $('s-campaign').value, daily_cap: $('s-cap').value, max: dry ? 3 : $('s-max').value,
            min_delay: dry ? 0 : $('s-min').value, max_delay: dry ? 0 : $('s-maxd').value,
            headless: $('s-headless').checked, personalize: $('s-personalize').checked,
+           read_profiles: $('s-personalize').checked && $('s-profiles').checked,
            without_note: $('s-nonote').checked, dry_run: dry };
 }
 $('btn-test').onclick = () => guard($('btn-test'), async () => { hide('send-msg'); await api('autosend', sendBody(true)); startPolling(); }, 'send-msg');
@@ -571,7 +603,9 @@ $('btn-send').onclick = () => guard($('btn-send'), async () => {
   const room = Math.max(0, $('s-cap').value - state.sent_24h);
   const n = Math.min(c.counts.draft, room, $('s-max').value || Infinity);
   if (!n) throw new Error(`The limit of ${$('s-cap').value} per 24 hours is already reached. Try again later.`);
-  if (!confirm(`Send ${n} message(s) from your LinkedIn account now?\n\nThis can take around ${Math.round(n * ((+$('s-min').value + +$('s-maxd').value) / 2) / 60)} minutes. Keep this page and the browser window open.`)) return;
+  const risky = +$('s-cap').value > state.daily_cap
+    ? `\n\nYou raised the limit above ${state.daily_cap} a day. The more you send, the likelier LinkedIn is to restrict the account.` : '';
+  if (!confirm(`Send ${n} message(s) from your LinkedIn account now?\n\nThis can take around ${Math.round(n * ((+$('s-min').value + +$('s-maxd').value) / 2) / 60)} minutes. Keep this page and the browser window open.${risky}`)) return;
   await api('autosend', sendBody(false)); startPolling();
 }, 'send-msg');
 $('btn-stop').onclick = () => api('stop');
@@ -595,7 +629,7 @@ function renderJob() {
   $('btn-tag-stop').style.display = running && tagging ? '' : 'none';
   $('btn-personalize-stop').style.display = running && personalizing ? '' : 'none';
   ['btn-test', 'btn-send', 'btn-import-li', 'btn-personalize', 'btn-replies', 'btn-tag', 'btn-prospects'].forEach(id => $(id).disabled = !!running);
-  $('ai-status').textContent = $('tag-ai-status').textContent = state.ai ? `Using ${state.ai}.` : 'Claude isn\'t reachable yet: set ANTHROPIC_API_KEY, or install Claude Code and run `claude login`.';
+  $('ai-status').textContent = $('tag-ai-status').textContent = state.ai ? `Using ${state.ai}.` : 'Claude isn\'t set up yet. In the tool\'s folder, copy .env.example to .env and put your Anthropic API key in it (or install Claude Code and log in); this page picks it up by itself.';
   if (!running && polling) { clearInterval(polling); polling = null;
     if (store.get('tab') === 'review') loadMessages(); if (importing || tagging || adding) search().catch(() => {}); }
 }

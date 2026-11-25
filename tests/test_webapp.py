@@ -56,9 +56,9 @@ class WebAppTest(unittest.TestCase):
             self.assertIn(b"AutoLink Messenger", r.read())
 
     def test_tag_filters_and_route_validation(self):
-        db = self.app.db()
-        db.execute("UPDATE contacts SET tags=',investor,' WHERE id=1")
-        db.commit()
+        with self.app.db() as db:
+            db.execute("UPDATE contacts SET tags=',investor,' WHERE id=1")
+            db.commit()
         _, r = self.post("contacts", {"filters": {"tag": "investor"}})
         self.assertEqual([c["tags"] for c in r["contacts"]], [["investor"]])
         self.assertEqual(self.app.filter_argv({"tag": "a, b", "limit": "5", "title": "cto"}),
@@ -79,6 +79,8 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(self.post("draft", self.draft_body(product="Acme"))[0], 200)
         _, m = self.post("messages", {"campaign": "web", "status": "draft"})
         self.assertEqual(len(m["messages"]), 2)
+        _, page = self.post("messages", {"campaign": "web", "status": "draft", "limit": 1})
+        self.assertEqual((len(page["messages"]), page["total"]), (1, 2))  # one page, and how many in all
         mid = m["messages"][0]["id"]
         self.post("message", {"id": mid, "body": "Edited"})
         self.post("message", {"id": m["messages"][1]["id"], "status": "skipped"})
@@ -86,6 +88,27 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual([x["body"] for x in m["messages"]], ["Edited"])
         _, st = self.post("state")
         self.assertEqual(st["campaigns"][0]["counts"]["skipped"], 1)
+        self.assertEqual(st["campaigns"][0]["counts"]["draft"], 1)
+        self.assertEqual((st["contacts"], st["prospects"], st["daily_cap"]), (5, 0, 20))
+
+    def test_personalize_reads_profiles_only_when_asked(self):
+        # Opening three profile pages per person is what LinkedIn limits, so it is never the default.
+        started = []
+        app = webapp.App(self.app.db_path, self.app.profile_dir, None)
+        app.start_process_job = lambda kind, cmd, **kw: started.append(cmd)
+        outreach_ai, webapp.outreach.ai_backend_name = webapp.outreach.ai_backend_name, lambda: "fake"
+        try:
+            app.api_personalize({"campaign": "web", "brief": "Get feedback", "max": "20"})
+            app.api_personalize({"campaign": "web", "brief": "Get feedback", "enrich": True})
+            app.api_autosend({"campaign": "web", "personalize": True})
+            app.api_autosend({"campaign": "web", "personalize": True, "read_profiles": True})
+        finally:
+            webapp.outreach.ai_backend_name = outreach_ai
+        self.assertEqual(started[0][started[0].index("--max") + 1], "20")
+        self.assertNotIn("--enrich", started[0])
+        self.assertIn("--enrich", started[1])
+        self.assertNotIn("--read-profiles", started[2])
+        self.assertIn("--read-profiles", started[3])
 
 
 if __name__ == "__main__":

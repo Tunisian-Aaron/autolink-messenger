@@ -1,4 +1,6 @@
+import contextlib
 import csv
+import io
 import sys
 import tempfile
 import unittest
@@ -51,8 +53,10 @@ class OutreachTest(unittest.TestCase):
         db = self.db()
         twins = [r["id"] for r in db.execute("SELECT id FROM contacts WHERE first_name='Élise' ORDER BY id")]
         db.execute("UPDATE messages SET status='sent' WHERE contact_id=?", (twins[0],))
+        db.execute("PRAGMA user_version = 0")  # as in a database made before links were decoded
         db.commit()
-        db = self.db()  # opening the database folds the twins together
+        db = self.db()  # opening an older database folds the twins together, once
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], outreach.SCHEMA_VERSION)
         rows = db.execute("SELECT id, key, do_not_contact FROM contacts WHERE first_name='Élise' ORDER BY id").fetchall()
         self.assertEqual([(r["key"], r["do_not_contact"]) for r in rows],
                          [("https://www.linkedin.com/in/élise-m", 0), (f"merged:{twins[1]}", 1)])
@@ -157,6 +161,52 @@ class OutreachTest(unittest.TestCase):
             "SELECT contact_id FROM messages m JOIN campaigns c ON c.id=m.campaign_id WHERE c.name='followup'")]
         self.assertNotIn(1, ids)
         self.assertEqual(len(ids), 4)
+
+    def test_opening_an_up_to_date_database_writes_nothing(self):
+        # The web page opens the database on every refresh while a sending run writes to it: an
+        # open that wrote (as the duplicate check once did on every open) would fight over the lock.
+        self.run_cli("import", str(SAMPLE))
+        writer = self.db()
+        writer.execute("UPDATE contacts SET company='Held' WHERE id=1")  # an open write transaction
+        db = outreach.connect(self.dbpath)  # must not need the write lock
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM contacts").fetchone()[0], 5)
+        db.close()
+        writer.rollback()
+
+    def test_mark_takes_untidy_ids_and_counts_what_matched(self):
+        self.draft_product()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_cli("mark", "beta", "1, 2,999,", "skipped")
+        self.assertIn("Marked 2 message(s) as skipped. 1 of the ids have no message", out.getvalue())
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("mark", "beta", "one", "sent")
+        self.assertIn("contact ids separated by commas", str(e.exception))
+
+    def test_plain_errors_instead_of_tracebacks(self):
+        self.run_cli("import", str(SAMPLE))
+        for argv, expected in (
+                (("review", "nope"), "No campaign named 'nope'. Create one with `draft` first."),
+                (("import", str(Path(self.tmp.name) / "missing.csv")), "File not found:"),
+                (("draft", "x", "--template", str(Path(self.tmp.name) / "missing.txt")), "File not found:")):
+            with self.assertRaises(SystemExit) as e:
+                self.run_cli(*argv)
+            self.assertIn(expected, str(e.exception))
+        self.draft_product()
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("autosend", "bta", "--yes")
+        self.assertIn("Your campaigns: beta.", str(e.exception))
+        self.assertIn("isn't downloaded yet", outreach.friendly_error(Exception(
+            "BrowserType.launch_persistent_context: Executable doesn't exist at /x/chrome")))
+        self.assertIsNone(outreach.friendly_error(ValueError("a real bug")))
+
+    def test_check_reports_the_setup(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):  # exits 1 without Playwright
+            self.run_cli("check", "--profile-dir", str(Path(self.tmp.name) / "no-login"))
+        text = out.getvalue()
+        self.assertIn("Not logged in to LinkedIn yet", text)
+        self.assertIn("5 connection(s), 0 campaign(s)", text)
 
     def test_export_import_roundtrip(self):
         self.draft_product()

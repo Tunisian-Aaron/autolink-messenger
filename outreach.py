@@ -22,6 +22,7 @@ import argparse
 import contextlib
 import csv
 import datetime as dt
+import importlib.util
 import io
 import json
 import os
@@ -37,10 +38,12 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from urllib.parse import unquote
 from urllib.parse import unquote, urlparse
 
-def load_env_file(path: Path = Path(__file__).resolve().parent / ".env"):
+HERE = Path(__file__).resolve().parent
+
+
+def load_env_file(path: Path = HERE / ".env"):
     """Read KEY=VALUE lines from a .env next to this file (gitignored), without overriding
     the real environment. Keeps the API key out of shell history and the web app's command."""
     if not path.is_file():
@@ -57,14 +60,15 @@ def load_env_file(path: Path = Path(__file__).resolve().parent / ".env"):
 
 load_env_file()
 
-DEFAULT_DB = os.environ.get("OUTREACH_DB", "outreach.db")
-DEFAULT_DAILY_CAP = 25
+# Next to this file by default, so the tool finds your data whatever folder you start it from.
+DEFAULT_DB = os.environ.get("OUTREACH_DB") or str(HERE / "outreach.db")
+DEFAULT_DAILY_CAP = 20    # messages per rolling 24h, across campaigns
 LINKEDIN_MAX_CHARS = 8000
 NOTE_CHARS = 200          # a connection request's note on a free account (LinkedIn's box says the real limit)
 NOTE_CHARS_PREMIUM = 300
 DEFAULT_INVITE_CAP = 15   # connection requests per rolling 24h; LinkedIn allows roughly 100 a week
 ACCEPT_LOOKBACK = 100  # how many of your newest connections to look through for people who accepted
-AI_MODEL = "claude-opus-5-5"
+AI_MODEL = os.environ.get("OUTREACH_AI_MODEL") or "claude-opus-5-5"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
@@ -108,33 +112,42 @@ def now() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
+SCHEMA_VERSION = 1  # raise it whenever migrate() learns something new
+
+
 def connect(path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+    # The web page reads while a sending run writes: wait for the other side instead of failing.
+    db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
+    if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        migrate(db)
+    return db
+
+
+def migrate(db):
+    """Create the tables and bring an older database up to date. Runs once per database (the
+    version is stored in it), so opening one costs nothing: the web page opens it on every refresh."""
     db.executescript(SCHEMA)
     cols = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
-    if "error" not in cols:  # databases created before autosend existed
-        db.execute("ALTER TABLE messages ADD COLUMN error TEXT")
-    if "ai_at" not in cols:  # ...and before `personalize`
-        db.execute("ALTER TABLE messages ADD COLUMN ai_at TEXT")
-    if "base_body" not in cols:  # the template text, before Claude rewrote it
-        db.execute("ALTER TABLE messages ADD COLUMN base_body TEXT")
-        db.execute("UPDATE messages SET base_body=body")
-    if "reply" not in cols:  # what `replies` saw them answer
-        db.execute("ALTER TABLE messages ADD COLUMN reply TEXT")
-    if "thread" not in cols:  # the conversation already there when the message was sent
-        db.execute("ALTER TABLE messages ADD COLUMN thread TEXT")
-    if "kind" not in cols:  # 'invite' when it went out as the note on a connection request
-        db.execute("ALTER TABLE messages ADD COLUMN kind TEXT")
-    if "invited_at" not in cols:  # when a connection request went to this person, with or without a note
-        db.execute("ALTER TABLE messages ADD COLUMN invited_at TEXT")
+    for col in ("error",        # databases created before autosend existed
+                "ai_at",        # ...and before `personalize`
+                "base_body",    # the template text, before Claude rewrote it
+                "reply",        # what `replies` saw them answer
+                "thread",       # the conversation already there when the message was sent
+                "kind",         # 'invite' when it went out as the note on a connection request
+                "invited_at"):  # when a connection request went to this person, with or without a note
+        if col not in cols:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
+            if col == "base_body":
+                db.execute("UPDATE messages SET base_body=body")
     contact_cols = {r[1] for r in db.execute("PRAGMA table_info(contacts)")}
     if "tags" not in contact_cols:
         db.execute("ALTER TABLE contacts ADD COLUMN tags TEXT")
     if "prospect" not in contact_cols:
         db.execute("ALTER TABLE contacts ADD COLUMN prospect INTEGER NOT NULL DEFAULT 0")
     merge_duplicate_contacts(db)
-    return db
+    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    db.commit()
 
 
 def contact_key(url: str, first: str = "", last: str = "") -> str:
@@ -146,7 +159,8 @@ def contact_key(url: str, first: str = "", last: str = "") -> str:
 def merge_duplicate_contacts(db):
     """Folds contacts stored twice under differently encoded links into one, so nobody gets a
     campaign's message twice. The row that was already messaged is kept; the other is marked
-    do-not-contact and loses its unsent drafts."""
+    do-not-contact and loses its unsent drafts. Only databases from before contact_key() decoded
+    links can hold such pairs, so this runs once, from migrate()."""
     groups = {}
     for c in db.execute("SELECT id, key, do_not_contact FROM contacts WHERE key NOT LIKE 'merged:%'"):
         groups.setdefault(contact_key(c["key"]) if not c["key"].startswith("name:") else c["key"], []).append(c)
@@ -166,6 +180,24 @@ def merge_duplicate_contacts(db):
         db.execute("UPDATE contacts SET key=?, do_not_contact=? WHERE id=?",
                    (key, max(r["do_not_contact"] for r in rows), keep["id"]))
     db.commit()
+
+
+def parse_ids(text) -> list[int]:
+    """'12, 40,' -> [12, 40]."""
+    try:
+        return [int(x) for x in re.split(r"[\s,]+", str(text or "")) if x]
+    except ValueError:
+        raise SystemExit(f"Expected contact ids separated by commas (like 12,40), got {text!r}.")
+
+
+def get_campaign(db, name: str):
+    """The campaign row, or a clear exit that lists the campaigns that do exist."""
+    camp = db.execute("SELECT * FROM campaigns WHERE name=?", (name,)).fetchone()
+    if camp is None:
+        names = [r[0] for r in db.execute("SELECT name FROM campaigns ORDER BY id DESC")]
+        raise SystemExit(f"No campaign named '{name}'. "
+                         + (f"Your campaigns: {', '.join(names)}." if names else "Create one with `draft` first."))
+    return camp
 
 
 def stop_flag() -> threading.Event:
@@ -403,7 +435,7 @@ def select_contacts(db, args, extra_where: str = "", extra_params=()):
         where.append("connected_on < ?")
         params.append(args.before)
     if args.ids:
-        ids = [int(x) for x in args.ids.split(",") if x.strip()]
+        ids = parse_ids(args.ids)
         where.append(f"id IN ({','.join('?' * len(ids))})")
         params.extend(ids)
     if extra_where:
@@ -425,7 +457,7 @@ def cmd_list(db, args):
 
 
 def cmd_dnc(db, args):
-    ids = [int(x) for x in args.ids.split(",") if x.strip()]
+    ids = parse_ids(args.ids)
     db.executemany("UPDATE contacts SET do_not_contact=? WHERE id=?", [(0 if args.undo else 1, i) for i in ids])
     db.commit()
     print(f"{'Cleared' if args.undo else 'Set'} do-not-contact on {len(ids)} contact(s).")
@@ -586,7 +618,7 @@ class ClaudeAPI:
     def generate(self, prompt: str) -> str | None:
         resp = self.client.beta.messages.create(
             model=AI_MODEL,
-            max_tokens=2048,
+            max_tokens=8000,  # a ceiling, not a target: thinking and the answer share it
             output_config={"effort": "low"},
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
@@ -629,10 +661,10 @@ def ai_backend():
 
 
 def ai_backend_name() -> str | None:
-    try:
-        return ai_backend().name
-    except SystemExit:
-        return None
+    """Which backend ai_backend() would pick, without creating it (the web page asks on every refresh)."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return ClaudeAPI.name if importlib.util.find_spec("anthropic") else None
+    return ClaudeCLI.name if shutil.which("claude") else None
 
 
 def recipient_facts(contact, profile=None) -> list[str]:
@@ -647,9 +679,9 @@ def recipient_facts(contact, profile=None) -> list[str]:
     return facts
 
 
-RECENT_OPENERS = 8
+RECENT_OPENERS = 8  # how many earlier messages the rewrite sees, so it doesn't repeat their hooks
 # Notes starting with this mean "don't send; the person is waiting on you in the conversation".
-HELD = "held for you"  # how many earlier messages the rewrite sees, so it doesn't repeat their hooks
+HELD = "held for you"
 
 
 def opener(body: str) -> str:
@@ -964,7 +996,7 @@ def enrich_targets(db, args):
     if getattr(args, "campaign", None):
         ids = [r["contact_id"] for r in campaign_messages(db, args.campaign, "draft")]
         if getattr(args, "ids", None):
-            wanted = {int(i) for i in str(args.ids).split(",") if i.strip()}
+            wanted = set(parse_ids(args.ids))
             ids = [i for i in ids if i in wanted]
         return [db.execute("SELECT * FROM contacts WHERE id=?", (i,)).fetchone() for i in ids]
     return select_contacts(db, args)
@@ -1053,9 +1085,7 @@ def personalize_message(db, ai, m, brief: str, page=None, sleep=time.sleep, thre
 
 
 def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: False, sleep=time.sleep):
-    camp = db.execute("SELECT * FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
-    if camp is None:
-        raise SystemExit(f"No campaign named '{args.campaign}'.")
+    camp = get_campaign(db, args.campaign)
     brief = (args.brief or camp["brief"] or "").strip()
     if not brief:
         raise SystemExit("Pass --brief 'what this campaign is for' (it's saved on the campaign for next time).")
@@ -1103,9 +1133,7 @@ def cmd_personalize(db, args, ai=None, page_factory=None, should_stop=lambda: Fa
 
 def cmd_delete_drafts(db, args):
     """Remove a campaign's waiting (and skipped/failed) messages; sent and replied ones stay."""
-    camp = db.execute("SELECT id FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
-    if camp is None:
-        raise SystemExit(f"No campaign named '{args.campaign}'.")
+    camp = get_campaign(db, args.campaign)
     n = db.execute("DELETE FROM messages WHERE campaign_id=? AND status IN ('draft','skipped','failed')",
                    (camp["id"],)).rowcount
     db.commit()
@@ -1113,9 +1141,7 @@ def cmd_delete_drafts(db, args):
 
 
 def cmd_delete_campaign(db, args):
-    camp = db.execute("SELECT id FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
-    if camp is None:
-        raise SystemExit(f"No campaign named '{args.campaign}'.")
+    camp = get_campaign(db, args.campaign)
     sent = db.execute("SELECT COUNT(*) FROM messages WHERE campaign_id=? AND status IN ('sent','replied')",
                       (camp["id"],)).fetchone()[0]
     if sent and not args.force:
@@ -1221,15 +1247,30 @@ def cmd_replies(db, args, page_factory=None, inbox=None):
 # Review / export / status
 # --------------------------------------------------------------------------
 
-def campaign_messages(db, name, status=None):
-    sql = ("SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position, c.prospect FROM messages m "
-           "JOIN campaigns k ON k.id=m.campaign_id JOIN contacts c ON c.id=m.contact_id "
-           "WHERE k.name=? AND c.do_not_contact=0")
+_CAMPAIGN_MESSAGES = ("FROM messages m JOIN campaigns k ON k.id=m.campaign_id JOIN contacts c ON c.id=m.contact_id "
+                      "WHERE k.name=? AND c.do_not_contact=0")
+
+
+def campaign_messages(db, name, status=None, limit=None):
+    sql = f"SELECT m.*, c.first_name, c.last_name, c.url, c.company, c.position, c.prospect {_CAMPAIGN_MESSAGES}"
     params = [name]
     if status:
         sql += " AND m.status=?"
         params.append(status)
-    return db.execute(sql + " ORDER BY m.id", params).fetchall()
+    sql += " ORDER BY m.id"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return db.execute(sql, params).fetchall()
+
+
+def count_messages(db, name, status=None) -> int:
+    """How many messages campaign_messages would return, without loading them."""
+    sql, params = f"SELECT COUNT(*) {_CAMPAIGN_MESSAGES}", [name]
+    if status:
+        sql += " AND m.status=?"
+        params.append(status)
+    return db.execute(sql, params).fetchone()[0]
 
 
 def message_row(db, message_id):
@@ -1239,6 +1280,7 @@ def message_row(db, message_id):
 
 
 def cmd_review(db, args):
+    get_campaign(db, args.campaign)
     rows = campaign_messages(db, args.campaign, args.status)
     for m in rows:
         print(f"=== contact #{m['contact_id']}  {m['first_name']} {m['last_name']}  "
@@ -1247,6 +1289,7 @@ def cmd_review(db, args):
 
 
 def cmd_export(db, args):
+    get_campaign(db, args.campaign)
     rows = campaign_messages(db, args.campaign, args.status)
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1259,9 +1302,7 @@ def cmd_export(db, args):
 
 def cmd_import_drafts(db, args):
     """Replace draft bodies from a CSV with contact_id + message columns (e.g. an edited export)."""
-    camp = db.execute("SELECT id FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
-    if camp is None:
-        raise SystemExit(f"No campaign '{args.campaign}'.")
+    camp = get_campaign(db, args.campaign)
     updated = skipped = 0
     with open(args.csv, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -1292,17 +1333,19 @@ def cmd_status(db, args):
 
 
 def cmd_mark(db, args):
-    camp = db.execute("SELECT id FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
-    if camp is None:
-        raise SystemExit(f"No campaign '{args.campaign}'.")
-    ids = [int(x) for x in args.contact_ids.split(",")]
+    camp = get_campaign(db, args.campaign)
+    ids = parse_ids(args.contact_ids)
+    marked = 0
     for cid in ids:
-        db.execute("UPDATE messages SET status=?, updated_at=?, sent_at=COALESCE(sent_at, CASE WHEN ? IN "
-                   "('sent','replied') THEN ? END), error=CASE WHEN ?='draft' THEN NULL ELSE error END "
-                   "WHERE campaign_id=? AND contact_id=?",
-                   (args.status, now(), args.status, now(), args.status, camp["id"], cid))
+        marked += db.execute(
+            "UPDATE messages SET status=?, updated_at=?, sent_at=COALESCE(sent_at, CASE WHEN ? IN "
+            "('sent','replied') THEN ? END), error=CASE WHEN ?='draft' THEN NULL ELSE error END "
+            "WHERE campaign_id=? AND contact_id=?",
+            (args.status, now(), args.status, now(), args.status, camp["id"], cid)).rowcount
     db.commit()
-    print(f"Marked {len(ids)} message(s) as {args.status}.")
+    print(f"Marked {marked} message(s) as {args.status}."
+          + (f" {len(ids) - marked} of the ids have no message in '{args.campaign}' (they are contact ids, "
+             "the number `review` shows after 'contact #')." if marked < len(ids) else ""))
 
 
 # --------------------------------------------------------------------------
@@ -1361,6 +1404,7 @@ def edit_text(text: str, prompt=input) -> str:
 
 
 def cmd_send(db, args, prompt=input, clipboard=copy_to_clipboard, opener=webbrowser.open):
+    get_campaign(db, args.campaign)
     queue = campaign_messages(db, args.campaign, "draft")
     if not queue:
         print("Nothing left to send in this campaign.")
@@ -1400,7 +1444,7 @@ def cmd_send(db, args, prompt=input, clipboard=copy_to_clipboard, opener=webbrow
             db.execute("UPDATE messages SET status='sent', sent_at=?, updated_at=? WHERE id=?",
                        (now(), now(), m["id"]))
         db.commit()
-    remaining = len(campaign_messages(db, args.campaign, "draft"))
+    remaining = count_messages(db, args.campaign, "draft")
     print(f"\nDone for now. {remaining} draft(s) remaining; sent in last 24h: {sent_last_24h(db)}.")
 
 
@@ -1444,10 +1488,9 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
     import linkedin_browser as lb
     if args.min_delay > args.max_delay:
         raise SystemExit("--min-delay must be <= --max-delay")
-    brief = ""
+    camp, brief = get_campaign(db, args.campaign), ""
     if getattr(args, "personalize", False):  # fail before touching the browser if Claude isn't set up
-        camp = db.execute("SELECT brief FROM campaigns WHERE name=?", (args.campaign,)).fetchone()
-        brief = (camp["brief"] if camp else "") or ""
+        brief = camp["brief"] or ""
         if not brief:
             raise SystemExit("--personalize needs the campaign's brief: set it with "
                              f"`personalize {args.campaign} --brief '...'` (or on the Review tab).")
@@ -1550,7 +1593,7 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
             invite = m["prospect"] == 1
             blank = invite and getattr(args, "without_note", False)  # the message waits until they accept
             rewrite = ai is not None and not m["ai_at"] and not blank
-            if rewrite and not getattr(args, "no_profile_read", False):
+            if rewrite and getattr(args, "read_profiles", False):
                 try:  # their profile first: reading it leaves the page, so before the conversation opens
                     ensure_profile(db, m, page, sleep)
                 except lb.StopRun:
@@ -1654,13 +1697,96 @@ def cmd_autosend(db, args, sender_factory=None, sleep=time.sleep, prompt=input, 
     verb = "checked" if args.dry_run else "sent"
     blank = f", {invited} {'checked' if args.dry_run else 'invited'} without a note" if invited else ""
     print(f"\nDone: {sent} {verb}, {len(failed_ids)} failed{f', {held} held for you' if held else ''}{blank}. "
-          f"{len(campaign_messages(db, args.campaign, 'draft'))} draft(s) remaining.")
+          f"{count_messages(db, args.campaign, 'draft')} draft(s) remaining.")
     if failed_ids and not args.dry_run:
         print(f"Failed messages are marked 'failed' (see `review {args.campaign} --status failed`); "
               f"requeue with `mark {args.campaign} {','.join(map(str, failed_ids))} draft`.")
     if held and not args.dry_run:
         print(f"Held messages are marked 'skipped' (see `review {args.campaign} --status skipped`): "
               "answer those people yourself first.")
+
+
+# --------------------------------------------------------------------------
+# Setup check and plain-language errors
+# --------------------------------------------------------------------------
+
+SETUP_HINT = "Run `python3 start.py` (it installs everything), or: pip install -r requirements.txt && playwright install chromium"
+
+
+def browser_problem(channel: str | None = None) -> str | None:
+    """Why automated browsing can't start on this computer, or None when it can."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return f"Playwright isn't installed. {SETUP_HINT}"
+    if channel or os.environ.get("OUTREACH_BROWSER_PATH"):
+        return None  # your own Chrome/Edge is used, so Playwright's Chromium isn't needed
+    try:
+        with sync_playwright() as pw:
+            if not Path(pw.chromium.executable_path).exists():
+                return ("The automation browser isn't downloaded yet. Run `python3 start.py`, "
+                        "or: python -m playwright install chromium")
+    except Exception as e:
+        return f"Playwright can't start ({(str(e).strip().splitlines() or [type(e).__name__])[0]}). {SETUP_HINT}"
+    return None
+
+
+def friendly_error(e: BaseException) -> str | None:
+    """A sentence for the mistakes and hiccups a person can fix; None for a real bug."""
+    text = str(e)
+    if isinstance(e, FileNotFoundError) and e.filename:
+        return f"File not found: {e.filename}"
+    if isinstance(e, PermissionError) and e.filename:
+        return f"Can't open {e.filename}: permission denied."
+    if isinstance(e, sqlite3.OperationalError) and "locked" in text:
+        return ("The database is busy: another run is writing to it. Wait for that run to finish "
+                "(or stop it) and try again.")
+    if isinstance(e, sqlite3.DatabaseError) and "not a database" in text:
+        return "That file isn't an AutoLink Messenger database. Check --db / OUTREACH_DB."
+    if "Executable doesn't exist" in text:
+        return ("The automation browser isn't downloaded yet. Run `python3 start.py`, "
+                "or: python -m playwright install chromium")
+    if "ProcessSingleton" in text or "SingletonLock" in text or "user data directory is already in use" in text:
+        return ("The automation browser is already open: another run is using it. Wait for that run to "
+                "finish, or close its browser window, then try again.")
+    if "Missing X server" in text or "$DISPLAY" in text:
+        return "This computer has no display for the browser window. Add --headless."
+    if network_error(e):
+        return "No internet connection (the browser couldn't reach LinkedIn). Reconnect and run it again."
+    return None
+
+
+def cmd_check(db, args):
+    """Say what is set up and what isn't, in the order a new user needs it."""
+    import linkedin_browser as lb
+    failed = False
+
+    def line(ok, text):
+        print(f"  {'ok' if ok else ('--' if ok is None else 'x ')}  {text}")
+
+    print("AutoLink Messenger setup\n")
+    line(True, f"Python {sys.version.split()[0]}")
+    problem = browser_problem(getattr(args, "channel", None))
+    failed |= bool(problem)
+    line(not problem, problem or "Playwright and its browser are installed")
+    profile = Path(args.profile_dir or lb.DEFAULT_PROFILE_DIR)
+    line(True if profile.exists() else None,
+         f"A LinkedIn login was saved before, in {profile}" if profile.exists() else
+         "Not logged in to LinkedIn yet: the first import or send opens a window where you log in")
+    ai = ai_backend_name()
+    line(True if ai else None,
+         f"Claude is reachable through {ai} (model {AI_MODEL})" if ai else
+         "Claude isn't set up. It is optional: only personalizing messages and sorting people into groups "
+         "need it. Put ANTHROPIC_API_KEY in a .env file (see .env.example), or install Claude Code")
+    contacts = db.execute("SELECT COUNT(*) FROM contacts WHERE prospect=0").fetchone()[0]
+    camps = db.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0]
+    line(True, f"Database: {Path(args.db).resolve()} ({contacts} connection(s), {camps} campaign(s), "
+               f"{sent_last_24h(db)} sent in the last 24h)")
+    print("\n  ok = ready   -- = optional or not done yet   x = needs fixing")
+    if failed:
+        raise SystemExit(1)
+    if not contacts:
+        print("\nNext: import your connections (`import-linkedin`, or the Contacts tab of the web page).")
 
 
 # --------------------------------------------------------------------------
@@ -1696,7 +1822,7 @@ def build_parser():
     s.add_argument("--sender-name", help="fills {sender_name}")
     s.add_argument("--var", action="append", default=[], metavar="KEY=VALUE",
                    help="fills {sender_KEY}, e.g. --var product=Acme (repeatable)")
-    s.add_argument("--ai", action="store_true", help="personalize each draft with Claude (needs ANTHROPIC_API_KEY)")
+    s.add_argument("--ai", action="store_true", help="personalize each draft with Claude (needs --brief)")
     s.add_argument("--cooldown-days", type=int, default=30,
                    help="skip anyone messaged in any campaign within N days (default 30)")
     s.add_argument("--priority", metavar="TAG,TAG,...",
@@ -1785,8 +1911,8 @@ def build_parser():
     s = sub.add_parser("autosend", help="FULLY AUTOMATED: send drafts from your browser session")
     s.add_argument("campaign")
     browser_args(s)
-    s.add_argument("--daily-cap", type=int, default=20,
-                   help="max messages per rolling 24h across campaigns (default 20)")
+    s.add_argument("--daily-cap", type=int, default=DEFAULT_DAILY_CAP,
+                   help=f"max messages per rolling 24h across campaigns (default {DEFAULT_DAILY_CAP})")
     s.add_argument("--invite-cap", type=int, default=DEFAULT_INVITE_CAP,
                    help=f"max connection requests per rolling 24h (default {DEFAULT_INVITE_CAP})")
     s.add_argument("--without-note", action="store_true",
@@ -1798,13 +1924,16 @@ def build_parser():
     s.add_argument("--dry-run", action="store_true",
                    help="open each profile and type the message, but don't press Send")
     s.add_argument("--personalize", action="store_true",
-                   help="read each person's profile and have Claude rewrite their message right before sending")
-    s.add_argument("--no-profile-read", action="store_true",
-                   help="with --personalize: rewrite from what is already stored (headline, company, title) and the "
-                        "conversation, without opening the profile's details pages (three fewer page loads a person)")
+                   help="have Claude rewrite each message right before sending, from what is stored about the "
+                        "person (headline, company, title) and the conversation you already have with them")
+    s.add_argument("--read-profiles", action="store_true",
+                   help="with --personalize: also open each person's About, Experience and Education first. More "
+                        "to write from, but three more page loads a person, and LinkedIn limits profile views")
+    s.add_argument("--no-profile-read", action="store_true", help=argparse.SUPPRESS)  # now the default; older commands still run
     s.add_argument("--headless", action="store_true", help="hide the browser window")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt (for scheduled runs)")
-    s.add_argument("--screenshots", default="failures", help="where to save failure screenshots")
+    s.add_argument("--screenshots", default=str(HERE / "failures"),
+                   help="where to save failure screenshots (default: failures/ next to this file)")
     s.set_defaults(func=cmd_autosend)
 
     s = sub.add_parser("replies", help="read your inbox and mark who replied")
@@ -1836,6 +1965,10 @@ def build_parser():
 
     s = sub.add_parser("status", help="per-campaign counts and reply rate")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("check", help="check the setup: Playwright, LinkedIn login, Claude, database")
+    browser_args(s)
+    s.set_defaults(func=cmd_check)
     return p
 
 
@@ -1844,11 +1977,20 @@ def main(argv=None):
     if getattr(args, "profile_dir", "unset") is None:
         import linkedin_browser as lb
         args.profile_dir = lb.DEFAULT_PROFILE_DIR
-    db = connect(args.db)
     try:
-        args.func(db, args)
-    finally:
-        db.close()
+        db = connect(args.db)
+        try:
+            args.func(db, args)
+        finally:
+            db.close()
+    except KeyboardInterrupt:  # Ctrl-C: everything is saved as it happens, so there is nothing to undo
+        print("\nStopped. What was done so far is saved.")
+        raise SystemExit(130)
+    except Exception as e:
+        message = friendly_error(e)
+        if message is None:
+            raise
+        raise SystemExit(message)
 
 
 if __name__ == "__main__":
