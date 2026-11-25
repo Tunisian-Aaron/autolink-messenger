@@ -465,3 +465,8 @@ The browser tests run the real automation in a headless browser against a local
 mock of LinkedIn's profile, messaging and connections pages. They're skipped if
 Playwright isn't installed, and they never contact LinkedIn. The whole suite
 takes a few minutes, most of it waiting out the timeouts of the failure cases.
+
+## License
+
+MIT. See [LICENSE](LICENSE). The software comes with no warranty: what happens to a
+LinkedIn account you use it on is your own responsibility.
